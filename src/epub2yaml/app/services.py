@@ -4,10 +4,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import yaml
-
-from epub2yaml.domain.enums import ReviewAction, RunStatus
+from epub2yaml.domain.enums import BatchStatus, ReviewAction, RunStatus
 from epub2yaml.domain.models import BatchRecord, DocumentVersion, ReviewDecision, RunState
+from epub2yaml.domain.services import parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
@@ -81,15 +80,83 @@ class PipelineService:
         )
         if pipeline_state.batch is None:
             raise ValueError(pipeline_state.error_message or "工作流未生成批次")
+        if pipeline_state.batch_record_status == BatchStatus.FAILED:
+            raise ValueError(pipeline_state.error_message or "批次处理失败")
 
         record = BatchRecord(
             batch=pipeline_state.batch,
             status=pipeline_state.batch_record_status or "unknown",
             validation_errors=pipeline_state.validation_errors,
         )
+        if record.status == BatchStatus.FAILED:
+            raise ValueError(pipeline_state.error_message or "批次处理失败")
         return record
 
+    def run_to_completion(self, book_id: str, *, delta_yaml_by_batch: dict[str, str] | None = None) -> dict[str, Any]:
+        run_dir = self.runs_dir / book_id
+        state_store = StateStore(run_dir)
+        processed_batches: list[str] = []
+
+        while True:
+            run_state = state_store.load_run_state()
+            if run_state.next_chapter_index >= run_state.total_chapters:
+                run_state.status = RunStatus.COMPLETED
+                state_store.save_run_state(run_state)
+                break
+
+            next_batch_id = self._predict_next_batch_id(run_state)
+            record = self.process_next_batch(
+                book_id,
+                delta_yaml_text=(delta_yaml_by_batch or {}).get(next_batch_id),
+            )
+            self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
+            processed_batches.append(record.batch.batch_id)
+
+        final_state = state_store.load_run_state()
+        actors_path = run_dir / "current" / "actors.yaml"
+        worldinfo_path = run_dir / "current" / "worldinfo.yaml"
+        return {
+            "book_id": book_id,
+            "status": final_state.status,
+            "processed_batches": processed_batches,
+            "actors_path": str(actors_path),
+            "worldinfo_path": str(worldinfo_path),
+        }
+
+    def generate_yaml(
+        self,
+        epub_path: Path,
+        *,
+        book_id: str | None = None,
+        delta_yaml_by_batch: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        run_state = self.init_run(epub_path, book_id=book_id)
+        result = self.run_to_completion(run_state.book_id, delta_yaml_by_batch=delta_yaml_by_batch)
+        result["total_chapters"] = run_state.total_chapters
+        return result
+
     def review_batch(
+        self,
+        book_id: str,
+        *,
+        batch_id: str,
+        action: ReviewAction,
+        reviewer: str | None = None,
+        comment: str | None = None,
+        edited_actors_text: str | None = None,
+        edited_worldinfo_text: str | None = None,
+    ) -> ReviewDecision:
+        return self.commit_batch(
+            book_id,
+            batch_id=batch_id,
+            action=action,
+            reviewer=reviewer,
+            comment=comment,
+            edited_actors_text=edited_actors_text,
+            edited_worldinfo_text=edited_worldinfo_text,
+        )
+
+    def commit_batch(
         self,
         book_id: str,
         *,
@@ -125,14 +192,8 @@ class PipelineService:
 
         actors_text = edited_actors_text or batch_store.read_text_artifact(batch_id, "merged_actors.preview.yaml")
         worldinfo_text = edited_worldinfo_text or batch_store.read_text_artifact(batch_id, "merged_worldinfo.preview.yaml")
-
-        actors_payload = yaml.safe_load(actors_text) or {}
-        worldinfo_payload = yaml.safe_load(worldinfo_text) or {}
-        actors_content = actors_payload.get("actors", {})
-        worldinfo_content = worldinfo_payload.get("worldinfo", {})
-
-        if not isinstance(actors_content, dict) or not isinstance(worldinfo_content, dict):
-            raise ValueError("审阅后的 YAML 根节点结构不合法")
+        actors_content = parse_yaml_mapping_document(actors_text, root_key="actors")
+        worldinfo_content = parse_yaml_mapping_document(worldinfo_text, root_key="worldinfo")
 
         actors_version = run_state.current_actors_version + 1
         worldinfo_version = run_state.current_worldinfo_version + 1
@@ -141,7 +202,7 @@ class PipelineService:
         actors_history_path = yaml_store.save_history_document("actors", actors_version, actors_content)
         worldinfo_history_path = yaml_store.save_history_document("worldinfo", worldinfo_version, worldinfo_content)
 
-        input_payload = yaml.safe_load((run_dir / "batches" / batch_id / "input.json").read_text(encoding="utf-8"))
+        input_payload = state_store.load_batch_input(batch_id)
         chapter_start = int(input_payload["start_chapter_index"])
         chapter_end = int(input_payload["end_chapter_index"])
 
@@ -207,3 +268,10 @@ class PipelineService:
             "actors_version": run_state.current_actors_version,
             "worldinfo_version": run_state.current_worldinfo_version,
         }
+
+    @staticmethod
+    def _predict_next_batch_id(run_state: RunState) -> str:
+        next_batch_number = 1
+        if run_state.last_accepted_batch_id is not None:
+            next_batch_number = int(run_state.last_accepted_batch_id) + 1
+        return f"{next_batch_number:04d}"

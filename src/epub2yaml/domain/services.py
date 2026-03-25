@@ -60,9 +60,12 @@ def build_batches(chapters: list[Chapter], *, target_input_tokens: int, max_inpu
     return batches
 
 
-
 def parse_delta_yaml(delta_yaml: str) -> DeltaPackage:
-    parsed = yaml.safe_load(delta_yaml) or {}
+    try:
+        parsed = yaml.safe_load(delta_yaml) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Delta YAML 解析失败: {exc}") from exc
+
     if not isinstance(parsed, dict):
         raise ValueError("Delta YAML 根节点必须是映射")
 
@@ -81,6 +84,21 @@ def parse_delta_yaml(delta_yaml: str) -> DeltaPackage:
     return DeltaPackage(actors=actors, worldinfo=worldinfo)
 
 
+def parse_yaml_mapping_document(document_text: str, *, root_key: str) -> dict[str, Any]:
+    try:
+        payload = yaml.safe_load(document_text) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{root_key}.yaml 解析失败: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{root_key}.yaml 根节点必须是映射")
+
+    content = payload.get(root_key, {})
+    if not isinstance(content, dict):
+        raise ValueError(f"{root_key}.yaml 的 {root_key} 节点必须是映射")
+
+    return content
+
 
 def merge_document(current: dict[str, Any], delta: dict[str, Any] | None) -> dict[str, Any]:
     merged = deepcopy(current)
@@ -96,12 +114,10 @@ def merge_document(current: dict[str, Any], delta: dict[str, Any] | None) -> dic
     return merged
 
 
-
 def merge_delta_package(actors_current: dict[str, Any], worldinfo_current: dict[str, Any], delta_package: DeltaPackage) -> tuple[dict[str, Any], dict[str, Any]]:
     merged_actors = merge_document(actors_current, delta_package.actors)
     merged_worldinfo = merge_document(worldinfo_current, delta_package.worldinfo)
     return merged_actors, merged_worldinfo
-
 
 
 def dump_yaml_document(root_key: str, content: dict[str, Any]) -> str:

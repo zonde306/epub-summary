@@ -853,17 +853,132 @@ src/
 - 将状态存储从 JSON/SQLite 升级到数据库
 - 支持多本书任务队列与后台执行
 
-## 20. 实施建议结论
+## 20.1 当前实施进度
 
-综合你的需求，推荐采用如下方案：
+截至目前，LangChain 与 LangGraph 相关的最小可行实现已经落地，当前代码状态如下：
 
-- 编排层：LangGraph
-- 模型与提示词层：LangChain
-- 首版交互方式：本地 CLI
-- 输出文档类型：`actors`、`worldinfo`
-- 增量策略：携带上次已接受文档，生成本批候选更新
-- 提交策略：根节点级合并，角色条目与设定条目整条替换
-- 审阅机制：每批章节后人工决定接受、拒绝或人工修改
-- 恢复机制：持久化章节进度、批次状态、文档版本，并以检查点恢复
+### 已完成
 
-这个方案兼顾了首版实现复杂度、流程可控性、人工审阅可介入性，以及后续向多文档类型与服务化方向扩展的可行性。
+- 已实现 [`DocumentUpdateChain`](../src/epub2yaml/llm/chains/document_update_chain.py)，负责：
+  - Prompt 渲染
+  - 模型调用
+  - 将模型响应标准化为文本 Delta
+- 已实现 [`run_batch_generation_workflow`](../src/epub2yaml/workflow/graph.py)，由 LangGraph 串联以下节点：
+  - `load_run_state`
+  - `build_next_batch_by_budget`
+  - `load_current_documents`
+  - `build_prompt`
+  - `invoke_llm`
+  - `parse_delta_output`
+  - `validate_delta`
+  - `merge_delta_preview`
+  - `validate_merged_preview`
+  - `enqueue_review`
+  - `handle_failure`
+- 已将 [`PipelineService`](../src/epub2yaml/app/services.py) 接入工作流入口：
+  - 支持继续传入外部 `delta_yaml_text`
+  - 也支持注入 LangChain 模型链后由系统直接生成 Delta
+- 已落盘以下批次产物：
+  - `prompt.txt`
+  - `raw_output.md`
+  - `delta.yaml`
+  - `merged_actors.preview.yaml`
+  - `merged_worldinfo.preview.yaml`
+- 已补充测试覆盖：
+  - LangChain 提示词渲染与输出提取
+  - LangGraph 工作流落盘与状态流转
+  - `PipelineService` 通过模型链直接生成 Delta 的流程
+
+### 当前实现边界
+
+本次实现属于 LangChain 与 LangGraph 部分的 MVP，当前仍有以下边界：
+
+- Prompt 规则仍以内嵌字符串为主，尚未拆分为独立 prompt 文件
+- 工作流目前只覆盖“生成候选并入审阅队列”这一段
+- `wait_for_review`、`apply_review_result`、`commit_documents`、`route_next_batch`、`handle_rejection` 仍由应用服务层或后续实现承担
+- 尚未实现真正的图内断点恢复与图状态持久化
+- 尚未接入结构化 schema 校验器与黑名单值校验
+- CLI 仍未补齐 `resume-run`、`retry-batch` 等命令
+
+### 验证状态
+
+已通过测试命令验证：
+
+- `python -m unittest discover -s tests`
+
+当前测试总数为 10，全部通过。
+
+## 20.3 最小化可用版本定义
+
+基于最新确认，下一步优先实现的不是完整审阅工作台，而是一个**全自动最小版本**：
+
+- 输入：单个 EPUB 文件
+- 过程：自动提取章节、调用模型、按批次合并增量结果
+- 输出：最终 `actors.yaml` 与 `worldinfo.yaml`
+- 暂不包含：人工审阅、拒绝重试、断点恢复、图内等待节点
+
+### 这个最小版本必须具备的能力
+
+1. 一个直接可运行的 CLI 入口
+   - 例如单命令执行：输入 EPUB 后直接产出 YAML
+2. EPUB 章节提取
+   - 已有章节抽取基础能力，可直接复用
+3. 自动批处理
+   - 首版可继续使用现有按 token 预算切批能力
+4. LangChain 模型调用
+   - 需要从运行参数或环境变量读取模型配置
+   - 需要真正接上可用聊天模型，而不只是测试假模型
+5. LangGraph 自动流程
+   - 保留无人工分支的生成主链路即可
+6. Delta 解析与合并
+   - 将每批次 Delta 合并到当前正式文档
+7. YAML 最终落盘
+   - 在 `current/` 目录输出最终正式文档
+8. 基础失败处理
+   - 模型调用失败、YAML 解析失败时明确退出
+9. 最小验证
+   - 根节点结构校验
+   - `actors` / `worldinfo` 映射类型校验
+
+### 实现这个最小版本还缺什么
+
+当前代码距离该目标，主要还缺以下部分：
+
+- 缺少面向“输入 EPUB 直接输出最终 YAML”的单命令 CLI
+- 缺少真实模型初始化层
+  - 目前已实现 LangChain 链封装，但还没有一个稳定的模型工厂或配置加载入口
+- 缺少全自动批次循环提交逻辑
+  - 当前工作流能生成单批候选并落盘
+  - 但还没有“循环处理直到全部章节完成并直接提交 current 文档”的自动主流程
+- 缺少无审阅模式下的自动 commit 路径
+  - 当前正式写入仍主要依赖审阅后的提交逻辑
+- 缺少端到端集成测试
+  - 需要验证从 EPUB 输入到最终 YAML 输出的完整链路
+
+### 下一步实现顺序建议
+
+1. 增加最小 CLI 命令，例如 `generate-yaml`
+2. 增加模型配置与实例化入口
+3. 增加自动批次循环处理服务
+4. 打通“生成后直接提交 current 文档”的无审阅路径
+5. 补齐端到端测试与失败场景测试
+
+## 20.2 下一阶段建议任务
+
+在当前基础上，建议按以下顺序继续推进：
+
+1. 完成审阅后半段工作流节点
+   - 实现 `wait_for_review`
+   - 实现 `apply_review_result`
+   - 实现 `commit_documents`
+   - 实现 `update_checkpoint`
+   - 实现 `route_next_batch`
+   - 实现 `handle_rejection`
+2. 将提示词从代码内嵌文本迁移到 [`llm/prompts/`](../src/epub2yaml/llm/) 目录
+3. 增加 Delta 与 merged preview 的 schema 校验与黑名单值校验
+4. 补齐 CLI 命令：
+   - `resume-run`
+   - `retry-batch`
+   - 更完整的 `review-batch` 辅助输出
+5. 明确恢复策略，把工作流状态与业务状态对齐
+6. 视情况再决定是否引入 SQLite 持久化以替代纯文件式运行态

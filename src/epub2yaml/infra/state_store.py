@@ -54,6 +54,10 @@ class StateStore:
         path.write_text(batch.model_dump_json(indent=2), encoding="utf-8")
         return path
 
+    def load_batch_input(self, batch_id: str) -> dict[str, Any]:
+        path = self._batch_dir(batch_id) / "input.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def save_batch_record(self, record: BatchRecord) -> Path:
         batch_dir = self._batch_dir(record.batch.batch_id)
         path = batch_dir / "record.json"

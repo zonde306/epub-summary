@@ -7,12 +7,20 @@ import typer
 
 from epub2yaml.app.services import PipelineService
 from epub2yaml.domain.enums import ReviewAction
+from epub2yaml.llm.model_factory import create_document_update_chain_from_env
 
 app = typer.Typer(help="EPUB 小说转 YAML 文档处理 CLI")
 
 
 def get_workspace_dir() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def build_pipeline_service(*, provider: str | None = None, model: str | None = None) -> PipelineService:
+    document_update_chain = None
+    if provider is not None or model is not None:
+        document_update_chain = create_document_update_chain_from_env(provider=provider, model=model)
+    return PipelineService(get_workspace_dir(), document_update_chain=document_update_chain)
 
 
 @app.command("init-run")
@@ -23,6 +31,18 @@ def init_run(
     service = PipelineService(get_workspace_dir())
     state = service.init_run(epub_path=epub_path, book_id=book_id)
     typer.echo(json.dumps(state.model_dump(mode="json"), ensure_ascii=False, indent=2))
+
+
+@app.command("generate-yaml")
+def generate_yaml(
+    epub_path: Path = typer.Argument(..., exists=True, file_okay=True, dir_okay=False, readable=True, help="待处理 EPUB 文件路径"),
+    book_id: str | None = typer.Option(None, "--book-id", help="输出运行目录 ID，默认使用 EPUB 文件名"),
+    provider: str | None = typer.Option(None, "--provider", help="模型提供方，默认读取环境变量 EPUB2YAML_MODEL_PROVIDER"),
+    model: str | None = typer.Option(None, "--model", help="模型名称，默认读取环境变量 EPUB2YAML_MODEL"),
+) -> None:
+    service = build_pipeline_service(provider=provider, model=model)
+    result = service.generate_yaml(epub_path, book_id=book_id)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @app.command("process-next-batch")

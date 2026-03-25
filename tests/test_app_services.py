@@ -69,6 +69,41 @@ class PipelineServiceTests(unittest.TestCase):
                 self.assertIn("Alice", actors_path.read_text(encoding="utf-8"))
                 self.assertIn("Academy", worldinfo_path.read_text(encoding="utf-8"))
 
+    def test_run_to_completion_auto_commits_all_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "book.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "爱丽丝进入学院", 8),
+                    self._chapter(1, "第二章", "chapter2.xhtml", "导师介绍学院", 9),
+                ]
+                service.init_run(epub_path, book_id="book-auto")
+
+            result = service.run_to_completion(
+                "book-auto",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      actors:
+                        Alice:
+                          profile:
+                            role: hero
+                      worldinfo:
+                        Academy:
+                          content: magic school
+                    """,
+                },
+            )
+
+            self.assertEqual("completed", result["status"])
+            self.assertEqual(["0001"], result["processed_batches"])
+            self.assertTrue(Path(result["actors_path"]).exists())
+            self.assertTrue(Path(result["worldinfo_path"]).exists())
+
     def test_reject_review_keeps_versions_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)

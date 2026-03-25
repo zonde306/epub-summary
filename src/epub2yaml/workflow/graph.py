@@ -9,7 +9,7 @@ from langgraph.graph import END, START, StateGraph
 
 from epub2yaml.domain.enums import BatchStatus, RunStatus
 from epub2yaml.domain.models import BatchRecord, ChapterBatch, DeltaPackage, PipelineState
-from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml
+from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml, parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
@@ -246,7 +246,13 @@ def _invoke_llm(context: PipelineWorkflowContext):
                 previous_actors_yaml=state.get("actors_current", "actors: {}\n"),
                 previous_worldinfo_yaml=state.get("worldinfo_current", "worldinfo: {}\n"),
             )
-            result = context.document_update_chain.invoke(request)
+            try:
+                result = context.document_update_chain.invoke(request)
+            except Exception as exc:
+                return {
+                    "validation_errors": [f"模型调用失败: {exc}"],
+                    "error_message": f"模型调用失败: {exc}",
+                }
             raw_output = result.response_text
             state["prompt_text"] = result.prompt_text
 
@@ -328,18 +334,10 @@ def _validate_merged_preview():
             ("worldinfo", state.get("worldinfo_merged_preview")),
         ):
             try:
-                parsed = yaml.safe_load(content) or {}
-            except yaml.YAMLError as exc:
-                errors.append(f"{root_key} 预览 YAML 解析失败: {exc}")
+                parse_yaml_mapping_document(content or f"{root_key}: {{}}\n", root_key=root_key)
+            except ValueError as exc:
+                errors.append(str(exc))
                 continue
-
-            if not isinstance(parsed, dict):
-                errors.append(f"{root_key} 预览 YAML 根节点必须是映射")
-                continue
-
-            root_value = parsed.get(root_key, {})
-            if not isinstance(root_value, dict):
-                errors.append(f"{root_key} 预览 YAML 的 {root_key} 节点必须是映射")
 
         if errors:
             return {
