@@ -103,3 +103,4 @@ class PipelineState(BaseModel):
     edited_worldinfo: str | None = None
     next_action: str | None = None
     error_message: str | None = None
+    batch_record_status: str | None = None

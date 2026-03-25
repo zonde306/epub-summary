@@ -6,22 +6,24 @@ from typing import Any
 
 import yaml
 
-from epub2yaml.domain.enums import BatchStatus, ReviewAction, RunStatus
+from epub2yaml.domain.enums import ReviewAction, RunStatus
 from epub2yaml.domain.models import BatchRecord, DocumentVersion, ReviewDecision, RunState
-from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
 from epub2yaml.infra.yaml_store import YamlDocumentStore
+from epub2yaml.llm.chains.document_update_chain import DocumentUpdateChain
 from epub2yaml.utils.hashing import sha256_bytes, sha256_text
+from epub2yaml.workflow.graph import run_batch_generation_workflow
 from utils.epub_extract import extract_epub
 
 
 class PipelineService:
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(self, workspace_dir: Path, *, document_update_chain: DocumentUpdateChain | None = None) -> None:
         self.workspace_dir = workspace_dir
         self.runs_dir = workspace_dir / "runs"
         self.runs_dir.mkdir(parents=True, exist_ok=True)
+        self.document_update_chain = document_update_chain
 
     def init_run(self, epub_path: Path, *, book_id: str | None = None) -> RunState:
         resolved_book_id = book_id or epub_path.stem
@@ -62,59 +64,29 @@ class PipelineService:
         yaml_store.save_current_document("worldinfo", {})
         return run_state
 
-    def process_next_batch(self, book_id: str, *, delta_yaml_text: str) -> BatchRecord:
+    def process_next_batch(self, book_id: str, *, delta_yaml_text: str | None = None) -> BatchRecord:
         run_dir = self.runs_dir / book_id
         state_store = StateStore(run_dir)
-        yaml_store = YamlDocumentStore(run_dir)
-        batch_store = BatchArtifactStore(run_dir)
-        review_store = ReviewQueueStore(run_dir)
-
         run_state = state_store.load_run_state()
-        chapters = state_store.load_chapters()
-        remaining = chapters[run_state.next_chapter_index :]
-        if not remaining:
+        if run_state.next_chapter_index >= run_state.total_chapters:
             run_state.status = RunStatus.COMPLETED
             state_store.save_run_state(run_state)
             raise ValueError("所有章节都已处理完成")
 
-        next_batch_number = 1
-        if run_state.last_accepted_batch_id is not None:
-            next_batch_number = int(run_state.last_accepted_batch_id) + 1
-
-        batches = build_batches(
-            remaining,
-            target_input_tokens=run_state.target_input_tokens,
-            max_input_tokens=run_state.max_input_tokens,
-            min_chapters_per_batch=run_state.min_chapters_per_batch,
-            max_chapters_per_batch=run_state.max_chapters_per_batch,
-            batch_number_start=next_batch_number,
+        pipeline_state = run_batch_generation_workflow(
+            run_dir=run_dir,
+            book_id=book_id,
+            document_update_chain=self.document_update_chain,
+            llm_raw_output=delta_yaml_text,
         )
-        batch = batches[0]
+        if pipeline_state.batch is None:
+            raise ValueError(pipeline_state.error_message or "工作流未生成批次")
 
-        actors_current = yaml_store.load_document("actors")
-        worldinfo_current = yaml_store.load_document("worldinfo")
-        delta_package = parse_delta_yaml(delta_yaml_text)
-        merged_actors, merged_worldinfo = merge_delta_package(actors_current, worldinfo_current, delta_package)
-
-        batch_store.write_text_artifact(batch.batch_id, "delta.yaml", delta_yaml_text)
-        batch_store.write_text_artifact(batch.batch_id, "merged_actors.preview.yaml", dump_yaml_document("actors", merged_actors))
-        batch_store.write_text_artifact(batch.batch_id, "merged_worldinfo.preview.yaml", dump_yaml_document("worldinfo", merged_worldinfo))
-        state_store.save_batch_input(batch)
-
-        record = BatchRecord(batch=batch, status=BatchStatus.REVIEW_REQUIRED)
-        state_store.save_batch_record(record)
-        review_store.enqueue(batch.batch_id)
-        state_store.append_checkpoint(
-            "batch_generated",
-            {
-                "batch_id": batch.batch_id,
-                "chapter_start": batch.start_chapter_index,
-                "chapter_end": batch.end_chapter_index,
-            },
+        record = BatchRecord(
+            batch=pipeline_state.batch,
+            status=pipeline_state.batch_record_status or "unknown",
+            validation_errors=pipeline_state.validation_errors,
         )
-
-        run_state.status = RunStatus.REVIEW_REQUIRED
-        state_store.save_run_state(run_state)
         return record
 
     def review_batch(
