@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -10,7 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 from epub2yaml.domain.enums import BatchStatus, RunStatus
 from epub2yaml.domain.models import BatchRecord, ChapterBatch, DeltaPackage, FailureInfo, PipelineState
-from epub2yaml.domain.services import build_batches, detect_structure_loss, dump_yaml_document, merge_delta_package, parse_delta_yaml, parse_yaml_mapping_document
+from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml, parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
@@ -43,11 +41,6 @@ class GraphState(TypedDict, total=False):
     failure_retryable: bool | None
     suggested_action: str | None
     retry_count: int
-    structure_check_passed: bool
-    requires_loss_approval: bool
-    missing_paths: list[str]
-    actors_missing_paths: list[str]
-    worldinfo_missing_paths: list[str]
 
 
 @dataclass(frozen=True)
@@ -71,7 +64,6 @@ def build_pipeline_graph(context: PipelineWorkflowContext):
     graph.add_node("parse_delta_output", _parse_delta_output())
     graph.add_node("merge_delta_preview", _merge_delta_preview(context))
     graph.add_node("validate_merged_preview", _validate_merged_preview())
-    graph.add_node("detect_structure_loss", _detect_structure_loss())
     graph.add_node("enqueue_review", _enqueue_review(context))
     graph.add_node("handle_failure", _handle_failure(context))
 
@@ -115,11 +107,10 @@ def build_pipeline_graph(context: PipelineWorkflowContext):
         "validate_merged_preview",
         _route_after_step,
         {
-            "ok": "detect_structure_loss",
+            "ok": "enqueue_review",
             "failed": "handle_failure",
         },
     )
-    graph.add_edge("detect_structure_loss", "enqueue_review")
     graph.add_edge("enqueue_review", END)
     graph.add_edge("handle_failure", END)
     graph.add_edge("handle_finish", END)
@@ -423,84 +414,23 @@ def _validate_merged_preview():
     return node
 
 
-def _detect_structure_loss():
-    def node(state: GraphState) -> GraphState:
-        result = detect_structure_loss(
-            previous_actors_document=state.get("actors_current", "actors: {}\n"),
-            current_actors_document=state.get("actors_merged_preview") or "actors: {}\n",
-            previous_worldinfo_document=state.get("worldinfo_current", "worldinfo: {}\n"),
-            current_worldinfo_document=state.get("worldinfo_merged_preview") or "worldinfo: {}\n",
-        )
-        return {
-            "structure_check_passed": bool(result["structure_check_passed"]),
-            "requires_loss_approval": bool(result["requires_loss_approval"]),
-            "missing_paths": list(result["missing_paths"]),
-            "actors_missing_paths": list(result["actors_missing_paths"]),
-            "worldinfo_missing_paths": list(result["worldinfo_missing_paths"]),
-        }
-
-    return node
-
 def _enqueue_review(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
         batch = _require_batch(state)
         batch_id = batch.batch_id
-        actors_preview = state.get("actors_merged_preview") or "actors: {}\n"
-        worldinfo_preview = state.get("worldinfo_merged_preview") or "worldinfo: {}\n"
-        missing_paths = list(state.get("missing_paths", []))
-        actors_missing_paths = list(state.get("actors_missing_paths", []))
-        worldinfo_missing_paths = list(state.get("worldinfo_missing_paths", []))
-        structure_check_passed = bool(state.get("structure_check_passed", True))
-        requires_loss_approval = bool(state.get("requires_loss_approval", False))
-        review_kind = "structure_loss_review" if requires_loss_approval else "normal_review"
-
         context.batch_store.write_text_artifact(batch_id, "prompt.txt", state.get("prompt_text") or "")
         context.batch_store.write_text_artifact(batch_id, "raw_output.md", state.get("llm_raw_output") or "")
         context.batch_store.write_text_artifact(batch_id, "delta.yaml", state.get("delta_yaml") or "")
-        context.batch_store.write_text_artifact(batch_id, "merged_actors.preview.yaml", actors_preview)
-        context.batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", worldinfo_preview)
-
-        structure_check_payload = {
-            "checked_at": datetime.utcnow().isoformat(),
-            "batch_id": batch_id,
-            "baseline": {
-                "actors": "current/actors.yaml",
-                "worldinfo": "current/worldinfo.yaml",
-            },
-            "preview": {
-                "actors": f"batches/{batch_id}/merged_actors.preview.yaml",
-                "worldinfo": f"batches/{batch_id}/merged_worldinfo.preview.yaml",
-            },
-            "structure_check_passed": structure_check_passed,
-            "requires_loss_approval": requires_loss_approval,
-            "missing_paths_count": len(missing_paths),
-            "actors_missing_paths": actors_missing_paths,
-            "worldinfo_missing_paths": worldinfo_missing_paths,
-        }
-        context.batch_store.write_text_artifact(
-            batch_id,
-            "structure_check.json",
-            json.dumps(structure_check_payload, ensure_ascii=False, indent=2),
-        )
-        context.batch_store.write_text_artifact(
-            batch_id,
-            "missing_paths.txt",
-            "\n".join(missing_paths) + ("\n" if missing_paths else ""),
-        )
+        context.batch_store.write_text_artifact(batch_id, "merged_actors.preview.yaml", state.get("actors_merged_preview") or "actors: {}\n")
+        context.batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", state.get("worldinfo_merged_preview") or "worldinfo: {}\n")
 
         record = BatchRecord(
             batch=batch,
             status=BatchStatus.REVIEW_REQUIRED,
             retry_count=state.get("retry_count", 0),
-            structure_check_passed=structure_check_passed,
-            missing_paths=missing_paths,
-            actors_missing_paths=actors_missing_paths,
-            worldinfo_missing_paths=worldinfo_missing_paths,
-            requires_loss_approval=requires_loss_approval,
-            loss_approval_status="pending" if requires_loss_approval else None,
         )
         context.state_store.save_batch_record(record)
-        context.review_store.enqueue(batch_id, review_kind=review_kind)
+        context.review_store.enqueue(batch_id)
         context.state_store.append_checkpoint(
             "batch_generated",
             {
@@ -508,9 +438,6 @@ def _enqueue_review(context: PipelineWorkflowContext):
                 "chapter_start": batch.start_chapter_index,
                 "chapter_end": batch.end_chapter_index,
                 "retry_count": state.get("retry_count", 0),
-                "structure_check_passed": structure_check_passed,
-                "requires_loss_approval": requires_loss_approval,
-                "missing_paths_count": len(missing_paths),
             },
         )
 
@@ -518,24 +445,14 @@ def _enqueue_review(context: PipelineWorkflowContext):
         run_state.status = RunStatus.REVIEW_REQUIRED
         run_state.last_generated_batch_id = batch_id
         run_state.pending_review_batch_id = batch_id
-        run_state.pending_loss_review_batch_id = batch_id if requires_loss_approval else None
         run_state.last_failed_batch_id = None
         run_state.last_failed_stage = None
         run_state.last_failure_reason = None
         run_state.last_failure_retryable = None
-        run_state.last_structure_check_batch_id = batch_id
-        run_state.last_structure_check_passed = structure_check_passed
-        run_state.recommended_action = "review_structure_loss" if requires_loss_approval else "resume_pending_review"
+        run_state.recommended_action = "resume_pending_review"
         run_state.last_recovery_batch_id = batch_id
         context.state_store.save_run_state(run_state)
-        return {
-            "batch_record_status": BatchStatus.REVIEW_REQUIRED,
-            "structure_check_passed": structure_check_passed,
-            "requires_loss_approval": requires_loss_approval,
-            "missing_paths": missing_paths,
-            "actors_missing_paths": actors_missing_paths,
-            "worldinfo_missing_paths": worldinfo_missing_paths,
-        }
+        return {"batch_record_status": BatchStatus.REVIEW_REQUIRED}
 
     return node
 
@@ -564,11 +481,6 @@ def _handle_failure(context: PipelineWorkflowContext):
             record.status = BatchStatus.FAILED
             record.validation_errors = state.get("validation_errors", [])
             record.retry_count = state.get("retry_count", 0)
-            record.structure_check_passed = bool(state.get("structure_check_passed", record.structure_check_passed))
-            record.missing_paths = list(state.get("missing_paths", record.missing_paths))
-            record.actors_missing_paths = list(state.get("actors_missing_paths", record.actors_missing_paths))
-            record.worldinfo_missing_paths = list(state.get("worldinfo_missing_paths", record.worldinfo_missing_paths))
-            record.requires_loss_approval = bool(state.get("requires_loss_approval", record.requires_loss_approval))
             record.last_failure = FailureInfo(
                 stage=state.get("failure_stage") or "unknown",
                 message=state.get("error_message"),
@@ -584,14 +496,10 @@ def _handle_failure(context: PipelineWorkflowContext):
         run_state.status = RunStatus.FAILED
         run_state.last_generated_batch_id = batch_id
         run_state.pending_review_batch_id = None
-        run_state.pending_loss_review_batch_id = None
         run_state.last_failed_batch_id = batch_id
         run_state.last_failed_stage = state.get("failure_stage")
         run_state.last_failure_reason = state.get("error_message")
         run_state.last_failure_retryable = state.get("failure_retryable")
-        if batch_id is not None:
-            run_state.last_structure_check_batch_id = batch_id
-            run_state.last_structure_check_passed = state.get("structure_check_passed")
         run_state.recommended_action = state.get("suggested_action") or "retry_batch"
         run_state.last_recovery_batch_id = batch_id
         context.state_store.save_run_state(run_state)
@@ -604,9 +512,6 @@ def _handle_failure(context: PipelineWorkflowContext):
                 "retryable": state.get("failure_retryable"),
                 "suggested_action": state.get("suggested_action"),
                 "retry_count": state.get("retry_count", 0),
-                "structure_check_passed": state.get("structure_check_passed"),
-                "requires_loss_approval": state.get("requires_loss_approval"),
-                "missing_paths_count": len(state.get("missing_paths", [])),
             },
         )
         return {

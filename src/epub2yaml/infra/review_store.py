@@ -16,20 +16,15 @@ class ReviewQueueStore:
         self.history_path = self.state_dir / "review_history.jsonl"
         self.state_dir.mkdir(parents=True, exist_ok=True)
 
-    def enqueue(self, batch_id: str, *, review_kind: str = "normal_review") -> Path:
+    def enqueue(self, batch_id: str) -> Path:
         queue = self._load_queue()
-        queue[batch_id] = {
-            "batch_id": batch_id,
-            "status": "pending",
-            "review_kind": review_kind,
-        }
+        queue[batch_id] = {"batch_id": batch_id, "status": "pending"}
         self._save_queue(queue)
-        self._append_history({"event": "enqueued", "batch_id": batch_id, "review_kind": review_kind})
+        self._append_history({"event": "enqueued", "batch_id": batch_id})
         return self.queue_path
 
     def mark_decision(self, decision: ReviewDecision) -> Path:
         queue = self._load_queue()
-        previous_entry = queue.get(decision.batch_id, {})
         status = "accepted"
         if decision.decision == ReviewAction.REJECT.value:
             status = "rejected"
@@ -39,7 +34,6 @@ class ReviewQueueStore:
         queue[decision.batch_id] = {
             "batch_id": decision.batch_id,
             "status": status,
-            "review_kind": previous_entry.get("review_kind", "normal_review"),
             "reviewed_at": decision.reviewed_at.isoformat(),
         }
         self._save_queue(queue)
@@ -48,7 +42,6 @@ class ReviewQueueStore:
                 "event": "decision_recorded",
                 "batch_id": decision.batch_id,
                 "decision": decision.decision,
-                "review_kind": previous_entry.get("review_kind", "normal_review"),
                 "reviewed_at": decision.reviewed_at.isoformat(),
             }
         )
@@ -56,20 +49,9 @@ class ReviewQueueStore:
 
     def mark_retried(self, batch_id: str) -> Path:
         queue = self._load_queue()
-        previous_entry = queue.get(batch_id, {})
-        queue[batch_id] = {
-            "batch_id": batch_id,
-            "status": "retried",
-            "review_kind": previous_entry.get("review_kind", "normal_review"),
-        }
+        queue[batch_id] = {"batch_id": batch_id, "status": "retried"}
         self._save_queue(queue)
-        self._append_history(
-            {
-                "event": "retried",
-                "batch_id": batch_id,
-                "review_kind": previous_entry.get("review_kind", "normal_review"),
-            }
-        )
+        self._append_history({"event": "retried", "batch_id": batch_id})
         return self.queue_path
 
     def get_pending_batch_ids(self) -> list[str]:

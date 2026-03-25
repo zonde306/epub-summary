@@ -72,13 +72,10 @@ class RunState(BaseModel):
     last_accepted_batch_id: str | None = None
     last_generated_batch_id: str | None = None
     pending_review_batch_id: str | None = None
-    pending_loss_review_batch_id: str | None = None
     last_failed_batch_id: str | None = None
     last_failed_stage: str | None = None
     last_failure_reason: str | None = None
     last_failure_retryable: bool | None = None
-    last_structure_check_batch_id: str | None = None
-    last_structure_check_passed: bool | None = None
     recommended_action: str | None = None
     last_recovery_action: str | None = None
     last_recovery_batch_id: str | None = None
@@ -104,13 +101,6 @@ class BatchRecord(BaseModel):
     review_decision: ReviewDecision | None = None
     retry_count: int = 0
     last_failure: FailureInfo | None = None
-    structure_check_passed: bool = True
-    missing_paths: list[str] = Field(default_factory=list)
-    actors_missing_paths: list[str] = Field(default_factory=list)
-    worldinfo_missing_paths: list[str] = Field(default_factory=list)
-    requires_loss_approval: bool = False
-    loss_approval_status: str | None = None
-    loss_approval_comment: str | None = None
 
 
 class RecoveryDecision(BaseModel):
@@ -123,7 +113,6 @@ class RecoveryDecision(BaseModel):
     next_chapter_index: int | None = None
     total_chapters: int | None = None
     batch_status: str | None = None
-    review_kind: str | None = None
 
 
 class PipelineState(BaseModel):
@@ -151,8 +140,3 @@ class PipelineState(BaseModel):
     failure_retryable: bool | None = None
     suggested_action: str | None = None
     retry_count: int = 0
-    structure_check_passed: bool = True
-    requires_loss_approval: bool = False
-    missing_paths: list[str] = Field(default_factory=list)
-    actors_missing_paths: list[str] = Field(default_factory=list)
-    worldinfo_missing_paths: list[str] = Field(default_factory=list)

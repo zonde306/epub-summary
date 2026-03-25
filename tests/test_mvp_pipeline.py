@@ -143,38 +143,6 @@ class MVPPipelineTests(unittest.TestCase):
             self.assertEqual("completed", result["status"])
             self.assertEqual(["0001"], result["processed_batches"])
 
-    def test_generate_yaml_blocks_auto_commit_when_structure_loss_detected(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace_dir = Path(temp_dir)
-            service = PipelineService(workspace_dir)
-            epub_path = workspace_dir / "loss-run.epub"
-            epub_path.write_bytes(b"fake-epub")
-
-            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
-                mock_extract_epub.return_value = [
-                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 5),
-                ]
-                service.init_run(epub_path, book_id="loss-run-book")
-
-            run_dir = workspace_dir / "runs" / "loss-run-book"
-            (run_dir / "current" / "actors.yaml").write_text(
-                "actors:\n  Alice:\n    profile:\n      goals:\n        short_term: 保护妹妹\n",
-                encoding="utf-8",
-            )
-
-            with self.assertRaisesRegex(ValueError, "必须先人工审阅"):
-                service.run_to_completion(
-                    "loss-run-book",
-                    delta_yaml_by_batch={
-                        "0001": """
-                        delta:
-                          actors:
-                            Alice:
-                              profile: null
-                        """,
-                    },
-                )
-
     def test_generate_yaml_fails_when_epub_has_no_chapters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)

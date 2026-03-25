@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from epub2yaml.domain.models import Chapter
-from epub2yaml.domain.services import build_batches, detect_missing_document_paths, detect_missing_mapping_paths, detect_structure_loss, dump_yaml_document, merge_delta_package, parse_delta_yaml
+from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml
 
 
 class DomainServicesTests(unittest.TestCase):
@@ -119,89 +119,6 @@ class DomainServicesTests(unittest.TestCase):
         self.assertIn("actors:", document)
         self.assertIn("Alice:", document)
         self.assertIn("role: hero", document)
-
-    def test_detect_missing_mapping_paths_returns_nested_missing_keys(self) -> None:
-        previous = {
-            "Alice": {
-                "profile": {
-                    "goals": {
-                        "short_term": "保护妹妹",
-                    }
-                }
-            }
-        }
-        current = {
-            "Alice": {
-                "profile": {}
-            }
-        }
-
-        missing = detect_missing_mapping_paths(previous, current)
-
-        self.assertEqual(
-            [
-                "Alice.profile.goals",
-                "Alice.profile.goals.short_term",
-            ],
-            missing,
-        )
-
-    def test_detect_missing_document_paths_ignores_list_item_changes(self) -> None:
-        previous = """
-        actors:
-          Alice:
-            tags:
-              - tea
-              - calm
-        """
-        current = """
-        actors:
-          Alice:
-            tags:
-              - coffee
-        """
-
-        missing = detect_missing_document_paths(previous, current, root_key="actors")
-
-        self.assertEqual([], missing)
-
-    def test_detect_structure_loss_reports_both_documents(self) -> None:
-        result = detect_structure_loss(
-            previous_actors_document="""
-            actors:
-              Alice:
-                profile:
-                  goals:
-                    short_term: 保护妹妹
-            """,
-            current_actors_document="""
-            actors:
-              Alice:
-                profile: {}
-            """,
-            previous_worldinfo_document="""
-            worldinfo:
-              MagicSystem:
-                rules:
-                  cost: 高
-            """,
-            current_worldinfo_document="""
-            worldinfo:
-              MagicSystem:
-                rules: {}
-            """,
-        )
-
-        self.assertFalse(result["structure_check_passed"])
-        self.assertTrue(result["requires_loss_approval"])
-        self.assertEqual(
-            [
-                "Alice.profile.goals",
-                "Alice.profile.goals.short_term",
-                "MagicSystem.rules.cost",
-            ],
-            result["missing_paths"],
-        )
 
 
 if __name__ == "__main__":
