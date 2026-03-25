@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+from copy import deepcopy
+from typing import Any
+
+import yaml
+
+from epub2yaml.domain.models import Chapter, ChapterBatch, DeltaPackage
+from epub2yaml.utils.hashing import sha256_text
+
+
+def build_batches(chapters: list[Chapter], *, target_input_tokens: int, max_input_tokens: int, min_chapters_per_batch: int = 1, max_chapters_per_batch: int = 8, batch_number_start: int = 1) -> list[ChapterBatch]:
+    batches: list[ChapterBatch] = []
+    index = 0
+
+    while index < len(chapters):
+        batch_chapters: list[Chapter] = []
+        batch_tokens = 0
+
+        while index < len(chapters) and len(batch_chapters) < max_chapters_per_batch:
+            chapter = chapters[index]
+            next_tokens = batch_tokens + chapter.estimated_tokens
+
+            if batch_chapters and next_tokens > max_input_tokens:
+                break
+
+            if batch_chapters and len(batch_chapters) >= min_chapters_per_batch and batch_tokens >= target_input_tokens:
+                break
+
+            batch_chapters.append(chapter)
+            batch_tokens = next_tokens
+            index += 1
+
+            if batch_tokens >= target_input_tokens and len(batch_chapters) >= min_chapters_per_batch:
+                break
+
+        if not batch_chapters:
+            chapter = chapters[index]
+            batch_chapters = [chapter]
+            batch_tokens = chapter.estimated_tokens
+            index += 1
+
+        combined_text = "\n\n".join(
+            f"# Chapter {chapter.index + 1}: {chapter.title}\n{chapter.content_text}"
+            for chapter in batch_chapters
+        )
+        batch_id = f"{batch_number_start + len(batches):04d}"
+        batches.append(
+            ChapterBatch(
+                batch_id=batch_id,
+                start_chapter_index=batch_chapters[0].index,
+                end_chapter_index=batch_chapters[-1].index,
+                chapter_indices=[chapter.index for chapter in batch_chapters],
+                combined_text=combined_text,
+                combined_hash=sha256_text(combined_text),
+                estimated_input_tokens=batch_tokens,
+            )
+        )
+
+    return batches
+
+
+
+def parse_delta_yaml(delta_yaml: str) -> DeltaPackage:
+    parsed = yaml.safe_load(delta_yaml) or {}
+    if not isinstance(parsed, dict):
+        raise ValueError("Delta YAML 根节点必须是映射")
+
+    delta = parsed.get("delta", parsed)
+    if not isinstance(delta, dict):
+        raise ValueError("delta 节点必须是映射")
+
+    actors = delta.get("actors")
+    worldinfo = delta.get("worldinfo")
+
+    if actors is not None and not isinstance(actors, dict):
+        raise ValueError("delta.actors 必须是映射")
+    if worldinfo is not None and not isinstance(worldinfo, dict):
+        raise ValueError("delta.worldinfo 必须是映射")
+
+    return DeltaPackage(actors=actors, worldinfo=worldinfo)
+
+
+
+def merge_document(current: dict[str, Any], delta: dict[str, Any] | None) -> dict[str, Any]:
+    merged = deepcopy(current)
+    if not delta:
+        return merged
+
+    for key, value in delta.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = merge_document(merged[key], value)
+        else:
+            merged[key] = deepcopy(value)
+
+    return merged
+
+
+
+def merge_delta_package(actors_current: dict[str, Any], worldinfo_current: dict[str, Any], delta_package: DeltaPackage) -> tuple[dict[str, Any], dict[str, Any]]:
+    merged_actors = merge_document(actors_current, delta_package.actors)
+    merged_worldinfo = merge_document(worldinfo_current, delta_package.worldinfo)
+    return merged_actors, merged_worldinfo
+
+
+
+def dump_yaml_document(root_key: str, content: dict[str, Any]) -> str:
+    payload = {root_key: content}
+    return yaml.safe_dump(payload, allow_unicode=True, sort_keys=False)
