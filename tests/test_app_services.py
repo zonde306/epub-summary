@@ -104,7 +104,7 @@ class PipelineServiceTests(unittest.TestCase):
             self.assertTrue(Path(result["actors_path"]).exists())
             self.assertTrue(Path(result["worldinfo_path"]).exists())
 
-    def test_reject_review_keeps_versions_unchanged(self) -> None:
+    def test_reject_review_keeps_versions_unchanged_and_requires_retry(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             workspace_dir = Path(temp_dir)
             service = PipelineService(workspace_dir)
@@ -140,6 +140,65 @@ class PipelineServiceTests(unittest.TestCase):
                 self.assertEqual(0, status["actors_version"])
                 self.assertEqual(0, status["worldinfo_version"])
                 self.assertEqual(0, status["next_chapter_index"])
+                self.assertEqual("retry_failed_batch", status["recommended_action"])
+
+    def test_resume_run_prioritizes_pending_review_batch(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "resume.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="resume-book")
+
+            service.process_next_batch(
+                "resume-book",
+                delta_yaml_text="""
+                delta:
+                  actors:
+                    Alice:
+                      profile:
+                        role: hero
+                """,
+            )
+
+            decision = service.resume_run("resume-book")
+            self.assertEqual("resume_pending_review", decision.action)
+            self.assertEqual("0001", decision.batch_id)
+
+    def test_retry_last_failed_reuses_same_batch_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "retry.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="retry-book")
+
+            with self.assertRaisesRegex(ValueError, "Delta YAML 解析失败|delta 节点必须是映射|delta.actors 必须是映射"):
+                service.process_next_batch("retry-book", delta_yaml_text="delta: [broken]")
+
+            retried_record = service.retry_last_failed(
+                "retry-book",
+                delta_yaml_text="""
+                delta:
+                  actors:
+                    Alice:
+                      profile:
+                        role: hero
+                """,
+            )
+            self.assertEqual("0001", retried_record.batch.batch_id)
+            self.assertEqual(1, retried_record.retry_count)
+            self.assertEqual("review_required", retried_record.status)
 
     @staticmethod
     def _chapter(index: int, title: str, source_href: str, content_text: str, estimated_tokens: int):

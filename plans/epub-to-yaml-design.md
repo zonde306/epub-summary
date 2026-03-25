@@ -242,7 +242,8 @@ workspace/
       state/
         run_state.json
         checkpoints.jsonl
-        review_queue.jsonl
+        review_queue.json
+        review_history.jsonl
 ```
 
 ### 7.2 当前版本与历史版本分离
@@ -341,15 +342,60 @@ class ReviewDecision(BaseModel):
 ### 8.6 运行状态模型
 
 ```python
+class FailureInfo(BaseModel):
+    stage: str
+    message: str | None
+    errors: list[str]
+    retryable: bool
+    suggested_action: str | None
+    failed_at: datetime
+
+
 class RunState(BaseModel):
     book_id: str
     source_file: str
     total_chapters: int
     next_chapter_index: int
     last_accepted_batch_id: str | None
+    last_generated_batch_id: str | None
+    pending_review_batch_id: str | None
+    last_failed_batch_id: str | None
+    last_failed_stage: str | None
+    last_failure_reason: str | None
+    last_failure_retryable: bool | None
+    recommended_action: str | None
+    last_recovery_action: str | None
+    last_recovery_batch_id: str | None
     current_actors_version: int
     current_worldinfo_version: int
     status: str
+```
+
+### 8.7 批次记录增强
+
+```python
+class BatchRecord(BaseModel):
+    batch: ChapterBatch
+    status: str
+    validation_errors: list[str]
+    review_decision: ReviewDecision | None
+    retry_count: int
+    last_failure: FailureInfo | None
+```
+
+### 8.8 恢复决策模型
+
+```python
+class RecoveryDecision(BaseModel):
+    action: str
+    batch_id: str | None
+    reason: str | None
+    retryable: bool | None
+    target_stage: str | None
+    run_status: str | None
+    next_chapter_index: int | None
+    total_chapters: int | None
+    batch_status: str | None
 ```
 
 ## 9. LangGraph 工作流设计
@@ -865,12 +911,11 @@ src/
   - 将模型响应标准化为文本 Delta
 - 已实现 [`run_batch_generation_workflow`](../src/epub2yaml/workflow/graph.py)，由 LangGraph 串联以下节点：
   - `load_run_state`
-  - `build_next_batch_by_budget`
+  - `prepare_batch`
   - `load_current_documents`
   - `build_prompt`
   - `invoke_llm`
   - `parse_delta_output`
-  - `validate_delta`
   - `merge_delta_preview`
   - `validate_merged_preview`
   - `enqueue_review`
@@ -878,27 +923,33 @@ src/
 - 已将 [`PipelineService`](../src/epub2yaml/app/services.py) 接入工作流入口：
   - 支持继续传入外部 `delta_yaml_text`
   - 也支持注入 LangChain 模型链后由系统直接生成 Delta
-- 已落盘以下批次产物：
-  - `prompt.txt`
-  - `raw_output.md`
-  - `delta.yaml`
-  - `merged_actors.preview.yaml`
-  - `merged_worldinfo.preview.yaml`
+  - 已实现 `resume_run`、`retry_last_failed`、`retry_batch`
+  - 已实现恢复决策优先级：待审阅 > 可重试失败批次 > 新批次 > completed
+- 已增强状态与存储层：
+  - [`RunState`](../src/epub2yaml/domain/models.py) 已记录最近生成批次、待审阅批次、最近失败批次、失败阶段、推荐恢复动作
+  - [`BatchRecord`](../src/epub2yaml/domain/models.py) 已记录 `retry_count` 与结构化 `last_failure`
+  - [`StateStore`](../src/epub2yaml/infra/state_store.py) 已支持读取批次记录、查询待审阅批次、查询可重试失败批次、读取最近检查点
+  - [`ReviewQueueStore`](../src/epub2yaml/infra/review_store.py) 已拆分当前队列状态与历史审计日志
+- 已补齐 CLI 命令：
+  - `generate-yaml`
+  - `resume-run`
+  - `retry-last-failed`
+  - `retry-batch`
+  - `show-status`
 - 已补充测试覆盖：
   - LangChain 提示词渲染与输出提取
   - LangGraph 工作流落盘与状态流转
-  - `PipelineService` 通过模型链直接生成 Delta 的流程
+  - `PipelineService` 的恢复与重试路径
+  - `run_to_completion()` 在失败后重入继续执行的路径
 
 ### 当前实现边界
 
-本次实现属于 LangChain 与 LangGraph 部分的 MVP，当前仍有以下边界：
+本次实现已把阶段重点切换到“恢复与失败重试”，当前仍有以下边界：
 
-- Prompt 规则仍以内嵌字符串为主，尚未拆分为独立 prompt 文件
-- 工作流目前只覆盖“生成候选并入审阅队列”这一段
-- `wait_for_review`、`apply_review_result`、`commit_documents`、`route_next_batch`、`handle_rejection` 仍由应用服务层或后续实现承担
-- 尚未实现真正的图内断点恢复与图状态持久化
-- 尚未接入结构化 schema 校验器与黑名单值校验
-- CLI 仍未补齐 `resume-run`、`retry-batch` 等命令
+- 工作流仍然是“单批执行 + 服务层决策恢复”，尚未实现真正的图内长期挂起等待节点
+- 恢复依据仍以文件状态和批次记录为主，尚未引入数据库存储
+- 结构化失败信息已落盘，但 schema 校验器与黑名单值校验仍未扩展
+- CLI 当前直接输出 JSON 结果，尚未加入更细的差异展示与交互式审阅辅助
 
 ### 验证状态
 

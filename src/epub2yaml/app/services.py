@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from epub2yaml.domain.enums import BatchStatus, ReviewAction, RunStatus
-from epub2yaml.domain.models import BatchRecord, DocumentVersion, ReviewDecision, RunState
+from epub2yaml.domain.models import BatchRecord, DocumentVersion, FailureInfo, RecoveryDecision, ReviewDecision, RunState
 from epub2yaml.domain.services import parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
@@ -46,6 +46,7 @@ class PipelineService:
             total_chapters=len(chapters),
             next_chapter_index=0,
             status=RunStatus.INITIALIZED,
+            recommended_action="continue_new_batch",
         )
 
         state_store = StateStore(run_dir)
@@ -67,8 +68,12 @@ class PipelineService:
         run_dir = self.runs_dir / book_id
         state_store = StateStore(run_dir)
         run_state = state_store.load_run_state()
+        pending_review = state_store.find_pending_review_batch(run_state)
+        if pending_review is not None:
+            raise ValueError(f"存在待审阅批次 {pending_review.batch.batch_id}，请先 resume 或 review")
         if run_state.next_chapter_index >= run_state.total_chapters:
             run_state.status = RunStatus.COMPLETED
+            run_state.recommended_action = "completed"
             state_store.save_run_state(run_state)
             raise ValueError("所有章节都已处理完成")
 
@@ -87,6 +92,7 @@ class PipelineService:
             batch=pipeline_state.batch,
             status=pipeline_state.batch_record_status or "unknown",
             validation_errors=pipeline_state.validation_errors,
+            retry_count=pipeline_state.retry_count,
         )
         if record.status == BatchStatus.FAILED:
             raise ValueError(pipeline_state.error_message or "批次处理失败")
@@ -104,31 +110,49 @@ class PipelineService:
         processed_batches: list[str] = []
 
         while True:
-            run_state = state_store.load_run_state()
-            if run_state.next_chapter_index >= run_state.total_chapters:
-                run_state.status = RunStatus.COMPLETED
-                state_store.save_run_state(run_state)
+            decision = self.get_recovery_decision(book_id)
+            if decision.action == "completed":
+                final_state = state_store.load_run_state()
+                final_state.status = RunStatus.COMPLETED
+                final_state.recommended_action = "completed"
+                state_store.save_run_state(final_state)
                 break
 
-            next_batch_id = self._predict_next_batch_id(run_state)
+            target_batch_id = decision.batch_id or self._predict_next_batch_id(state_store.load_run_state())
             if progress_callback is not None:
+                current_state = state_store.load_run_state()
                 progress_callback(
                     {
                         "event": "batch_started",
                         "book_id": book_id,
-                        "batch_id": next_batch_id,
+                        "batch_id": target_batch_id,
                         "processed_batches": len(processed_batches),
-                        "total_chapters": run_state.total_chapters,
-                        "next_chapter_index": run_state.next_chapter_index,
+                        "total_chapters": current_state.total_chapters,
+                        "next_chapter_index": current_state.next_chapter_index,
+                        "recovery_action": decision.action,
                     }
                 )
 
-            record = self.process_next_batch(
-                book_id,
-                delta_yaml_text=(delta_yaml_by_batch or {}).get(next_batch_id),
-            )
-            self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
-            processed_batches.append(record.batch.batch_id)
+            if decision.action == "resume_pending_review":
+                self.commit_batch(book_id, batch_id=target_batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
+                processed_batches.append(target_batch_id)
+            elif decision.action == "retry_failed_batch":
+                record = self.retry_batch(
+                    book_id,
+                    batch_id=target_batch_id,
+                    delta_yaml_text=(delta_yaml_by_batch or {}).get(target_batch_id),
+                )
+                self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
+                processed_batches.append(record.batch.batch_id)
+            elif decision.action == "continue_new_batch":
+                record = self.process_next_batch(
+                    book_id,
+                    delta_yaml_text=(delta_yaml_by_batch or {}).get(target_batch_id),
+                )
+                self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
+                processed_batches.append(record.batch.batch_id)
+            else:
+                raise ValueError(decision.reason or f"不支持的恢复动作: {decision.action}")
 
             latest_state = state_store.load_run_state()
             if progress_callback is not None:
@@ -136,10 +160,11 @@ class PipelineService:
                     {
                         "event": "batch_completed",
                         "book_id": book_id,
-                        "batch_id": record.batch.batch_id,
+                        "batch_id": target_batch_id,
                         "processed_batches": len(processed_batches),
                         "total_chapters": latest_state.total_chapters,
                         "next_chapter_index": latest_state.next_chapter_index,
+                        "recovery_action": decision.action,
                     }
                 )
 
@@ -201,6 +226,62 @@ class PipelineService:
             edited_worldinfo_text=edited_worldinfo_text,
         )
 
+    def resume_run(self, book_id: str) -> RecoveryDecision:
+        decision = self.get_recovery_decision(book_id)
+        run_dir = self.runs_dir / book_id
+        state_store = StateStore(run_dir)
+        run_state = state_store.load_run_state()
+        run_state.last_recovery_action = decision.action
+        run_state.last_recovery_batch_id = decision.batch_id
+        run_state.recommended_action = decision.action
+        state_store.save_run_state(run_state)
+        return decision
+
+    def retry_last_failed(self, book_id: str, *, delta_yaml_text: str | None = None) -> BatchRecord:
+        decision = self.get_recovery_decision(book_id)
+        if decision.action != "retry_failed_batch" or decision.batch_id is None:
+            raise ValueError(decision.reason or "当前没有可重试失败批次")
+        return self.retry_batch(book_id, batch_id=decision.batch_id, delta_yaml_text=delta_yaml_text)
+
+    def retry_batch(self, book_id: str, *, batch_id: str, delta_yaml_text: str | None = None) -> BatchRecord:
+        run_dir = self.runs_dir / book_id
+        state_store = StateStore(run_dir)
+        review_store = ReviewQueueStore(run_dir)
+        run_state = state_store.load_run_state()
+        record = state_store.load_batch_record(batch_id)
+        if record is None:
+            raise ValueError(f"批次 {batch_id} 不存在")
+        if record.status not in {BatchStatus.FAILED, BatchStatus.REJECTED}:
+            raise ValueError(f"批次 {batch_id} 当前状态不支持重试: {record.status}")
+        if record.last_failure is not None and not record.last_failure.retryable:
+            raise ValueError(f"批次 {batch_id} 标记为不可重试")
+
+        review_store.mark_retried(batch_id)
+        run_state.status = RunStatus.RUNNING
+        run_state.last_recovery_action = "retry_failed_batch"
+        run_state.last_recovery_batch_id = batch_id
+        run_state.recommended_action = "retry_failed_batch"
+        state_store.save_run_state(run_state)
+        pipeline_state = run_batch_generation_workflow(
+            run_dir=run_dir,
+            book_id=book_id,
+            document_update_chain=self.document_update_chain,
+            llm_raw_output=delta_yaml_text,
+            batch_id=batch_id,
+            retry_count=record.retry_count + 1,
+        )
+        if pipeline_state.batch is None:
+            raise ValueError(pipeline_state.error_message or "工作流未生成批次")
+        if pipeline_state.batch_record_status == BatchStatus.FAILED:
+            raise ValueError(pipeline_state.error_message or "批次处理失败")
+
+        return BatchRecord(
+            batch=pipeline_state.batch,
+            status=pipeline_state.batch_record_status or "unknown",
+            validation_errors=pipeline_state.validation_errors,
+            retry_count=pipeline_state.retry_count,
+        )
+
     def commit_batch(
         self,
         book_id: str,
@@ -219,6 +300,10 @@ class PipelineService:
         review_store = ReviewQueueStore(run_dir)
 
         run_state = state_store.load_run_state()
+        record = state_store.load_batch_record(batch_id)
+        if record is None:
+            raise ValueError(f"批次 {batch_id} 不存在")
+
         decision = ReviewDecision(
             batch_id=batch_id,
             decision=action.value,
@@ -228,10 +313,28 @@ class PipelineService:
         )
 
         if action is ReviewAction.REJECT:
+            record.status = BatchStatus.REJECTED
+            record.review_decision = decision
+            record.last_failure = FailureInfo(
+                stage="review",
+                message=comment or "审阅拒绝",
+                errors=[comment] if comment else ["审阅拒绝"],
+                retryable=True,
+                suggested_action="retry_failed_batch",
+            )
+            record.validation_errors = record.last_failure.errors
+            state_store.save_batch_record(record)
             state_store.save_review_decision(decision)
-            review_store.save_decision(decision)
+            review_store.mark_decision(decision)
             state_store.append_checkpoint("batch_rejected", {"batch_id": batch_id})
             run_state.status = RunStatus.RUNNING
+            run_state.pending_review_batch_id = None
+            run_state.last_failed_batch_id = batch_id
+            run_state.last_failed_stage = "review"
+            run_state.last_failure_reason = record.last_failure.message
+            run_state.last_failure_retryable = True
+            run_state.recommended_action = "retry_failed_batch"
+            run_state.last_recovery_batch_id = batch_id
             state_store.save_run_state(run_state)
             return decision
 
@@ -283,7 +386,7 @@ class PipelineService:
         )
 
         state_store.save_review_decision(decision)
-        review_store.save_decision(decision)
+        review_store.mark_decision(decision)
         state_store.append_checkpoint(
             "batch_committed",
             {
@@ -293,26 +396,94 @@ class PipelineService:
             },
         )
 
+        record.status = BatchStatus.EDITED if action is ReviewAction.EDIT else BatchStatus.ACCEPTED
+        record.review_decision = decision
+        record.validation_errors = []
+        record.last_failure = None
+        state_store.save_batch_record(record)
+
         run_state.last_accepted_batch_id = batch_id
         run_state.current_actors_version = actors_version
         run_state.current_worldinfo_version = worldinfo_version
         run_state.next_chapter_index = chapter_end + 1
         run_state.status = RunStatus.COMPLETED if run_state.next_chapter_index >= run_state.total_chapters else RunStatus.RUNNING
+        run_state.pending_review_batch_id = None
+        run_state.last_failed_batch_id = None
+        run_state.last_failed_stage = None
+        run_state.last_failure_reason = None
+        run_state.last_failure_retryable = None
+        run_state.recommended_action = "completed" if run_state.status == RunStatus.COMPLETED else "continue_new_batch"
         state_store.save_run_state(run_state)
         return decision
 
     def show_status(self, book_id: str) -> dict[str, Any]:
         run_dir = self.runs_dir / book_id
-        run_state = StateStore(run_dir).load_run_state()
+        state_store = StateStore(run_dir)
+        run_state = state_store.load_run_state()
+        recovery_decision = self.get_recovery_decision(book_id)
         return {
             "book_id": run_state.book_id,
             "status": run_state.status,
             "total_chapters": run_state.total_chapters,
             "next_chapter_index": run_state.next_chapter_index,
             "last_accepted_batch_id": run_state.last_accepted_batch_id,
+            "last_generated_batch_id": run_state.last_generated_batch_id,
+            "pending_review_batch_id": run_state.pending_review_batch_id,
+            "last_failed_batch_id": run_state.last_failed_batch_id,
+            "last_failed_stage": run_state.last_failed_stage,
+            "last_failure_reason": run_state.last_failure_reason,
+            "recommended_action": recovery_decision.action,
             "actors_version": run_state.current_actors_version,
             "worldinfo_version": run_state.current_worldinfo_version,
         }
+
+    def get_recovery_decision(self, book_id: str) -> RecoveryDecision:
+        run_dir = self.runs_dir / book_id
+        state_store = StateStore(run_dir)
+        run_state = state_store.load_run_state()
+        pending_record = state_store.find_pending_review_batch(run_state)
+        if pending_record is not None:
+            return RecoveryDecision(
+                action="resume_pending_review",
+                batch_id=pending_record.batch.batch_id,
+                reason="存在待审阅批次",
+                run_status=run_state.status,
+                next_chapter_index=run_state.next_chapter_index,
+                total_chapters=run_state.total_chapters,
+                batch_status=pending_record.status,
+            )
+
+        failed_record = state_store.find_retryable_failed_batch(run_state)
+        if failed_record is not None:
+            return RecoveryDecision(
+                action="retry_failed_batch",
+                batch_id=failed_record.batch.batch_id,
+                reason=failed_record.last_failure.message if failed_record.last_failure else "存在可重试失败批次",
+                retryable=True,
+                target_stage=failed_record.last_failure.stage if failed_record.last_failure else None,
+                run_status=run_state.status,
+                next_chapter_index=run_state.next_chapter_index,
+                total_chapters=run_state.total_chapters,
+                batch_status=failed_record.status,
+            )
+
+        if run_state.next_chapter_index < run_state.total_chapters:
+            return RecoveryDecision(
+                action="continue_new_batch",
+                batch_id=self._predict_next_batch_id(run_state),
+                reason="无待审阅和失败批次，继续新批次",
+                run_status=run_state.status,
+                next_chapter_index=run_state.next_chapter_index,
+                total_chapters=run_state.total_chapters,
+            )
+
+        return RecoveryDecision(
+            action="completed",
+            reason="章节已全部提交",
+            run_status=run_state.status,
+            next_chapter_index=run_state.next_chapter_index,
+            total_chapters=run_state.total_chapters,
+        )
 
     @staticmethod
     def _predict_next_batch_id(run_state: RunState) -> str:

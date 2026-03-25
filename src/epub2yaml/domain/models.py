@@ -54,6 +54,15 @@ class ReviewDecision(BaseModel):
     reviewed_at: datetime
 
 
+class FailureInfo(BaseModel):
+    stage: str
+    message: str | None = None
+    errors: list[str] = Field(default_factory=list)
+    retryable: bool = True
+    suggested_action: str | None = None
+    failed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 class RunState(BaseModel):
     book_id: str
     source_file: str
@@ -61,6 +70,15 @@ class RunState(BaseModel):
     total_chapters: int
     next_chapter_index: int = 0
     last_accepted_batch_id: str | None = None
+    last_generated_batch_id: str | None = None
+    pending_review_batch_id: str | None = None
+    last_failed_batch_id: str | None = None
+    last_failed_stage: str | None = None
+    last_failure_reason: str | None = None
+    last_failure_retryable: bool | None = None
+    recommended_action: str | None = None
+    last_recovery_action: str | None = None
+    last_recovery_batch_id: str | None = None
     current_actors_version: int = 0
     current_worldinfo_version: int = 0
     status: str = "initialized"
@@ -81,6 +99,20 @@ class BatchRecord(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     validation_errors: list[str] = Field(default_factory=list)
     review_decision: ReviewDecision | None = None
+    retry_count: int = 0
+    last_failure: FailureInfo | None = None
+
+
+class RecoveryDecision(BaseModel):
+    action: str
+    batch_id: str | None = None
+    reason: str | None = None
+    retryable: bool | None = None
+    target_stage: str | None = None
+    run_status: str | None = None
+    next_chapter_index: int | None = None
+    total_chapters: int | None = None
+    batch_status: str | None = None
 
 
 class PipelineState(BaseModel):
@@ -104,3 +136,7 @@ class PipelineState(BaseModel):
     next_action: str | None = None
     error_message: str | None = None
     batch_record_status: str | None = None
+    failure_stage: str | None = None
+    failure_retryable: bool | None = None
+    suggested_action: str | None = None
+    retry_count: int = 0

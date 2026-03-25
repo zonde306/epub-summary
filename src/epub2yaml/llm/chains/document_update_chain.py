@@ -276,11 +276,26 @@ class DocumentUpdateChain:
     def invoke(self, request: DocumentUpdateRequest) -> DocumentUpdateResult:
         payload = self.build_payload(request)
         prompt_text = self.render_prompt(request)
-        response = self._chain.invoke(payload)
+        prompt_value = self.prompt.invoke(payload)
+        response_text = self._stream_response_to_text(prompt_value)
         return DocumentUpdateResult(
             prompt_text=prompt_text,
-            response_text=self._coerce_response_to_text(response),
+            response_text=response_text,
         )
+
+    def _stream_response_to_text(self, prompt_value: Any) -> str:
+        chunks: list[str] = []
+        try:
+            for chunk in self.model.stream(prompt_value):
+                text = self._coerce_response_to_text(chunk)
+                if text:
+                    chunks.append(text)
+        except (AttributeError, NotImplementedError):
+            return self._coerce_response_to_text(self.model.invoke(prompt_value))
+
+        if chunks:
+            return "".join(chunks)
+        return self._coerce_response_to_text(self.model.invoke(prompt_value))
 
     def _coerce_response_to_text(self, response: Any) -> str:
         if isinstance(response, BaseMessage):

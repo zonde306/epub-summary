@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -49,6 +50,39 @@ class LangChainAndLangGraphTests(unittest.TestCase):
         self.assertIn("爱丽丝进入学院", result.prompt_text)
         self.assertIn("delta:", result.response_text)
         self.assertIn("Alice", result.response_text)
+
+    def test_document_update_chain_prefers_streaming_output_when_available(self) -> None:
+        batch = Chapter(
+            index=0,
+            title="第一章",
+            source_href="chapter1.xhtml",
+            content_text="爱丽丝进入学院",
+            content_hash=sha256_text("爱丽丝进入学院"),
+            estimated_tokens=10,
+        )
+        request = DocumentUpdateRequest(
+            batch=self._batch_from_chapters([batch]),
+            previous_actors_yaml="actors: {}\n",
+            previous_worldinfo_yaml="worldinfo: {}\n",
+        )
+        stream_model = RunnableLambda(
+            lambda _: AIMessage(content="这条 invoke 结果不应被使用")
+        )
+        stream_model.stream = lambda _: iter(
+            [
+                AIMessage(content="delta:\n"),
+                AIMessage(content="  actors:\n"),
+                AIMessage(content="    Alice:\n      role: hero\n"),
+            ]
+        )
+        chain = DocumentUpdateChain(stream_model)
+
+        result = chain.invoke(request)
+
+        self.assertEqual(
+            "delta:\n  actors:\n    Alice:\n      role: hero\n",
+            result.response_text,
+        )
 
     def test_run_batch_generation_workflow_persists_preview_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

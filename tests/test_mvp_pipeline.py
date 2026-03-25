@@ -84,6 +84,7 @@ class MVPPipelineTests(unittest.TestCase):
             self.assertEqual("batch_completed", progress_events[2]["event"])
             self.assertEqual("0001", progress_events[1]["batch_id"])
             self.assertEqual("0001", progress_events[2]["batch_id"])
+            self.assertEqual("continue_new_batch", progress_events[1]["recovery_action"])
 
     def test_generate_yaml_fails_on_invalid_delta_yaml(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -105,6 +106,42 @@ class MVPPipelineTests(unittest.TestCase):
                         "0001": "delta: [not-a-mapping]",
                     },
                 )
+
+    def test_generate_yaml_can_resume_after_failure_during_run_to_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "retry-run.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 5),
+                ]
+                service.init_run(epub_path, book_id="retry-run-book")
+
+            with self.assertRaisesRegex(ValueError, "Delta YAML 解析失败|delta 节点必须是映射|delta.actors 必须是映射"):
+                service.run_to_completion(
+                    "retry-run-book",
+                    delta_yaml_by_batch={
+                        "0001": "delta: [not-a-mapping]",
+                    },
+                )
+
+            result = service.run_to_completion(
+                "retry-run-book",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      actors:
+                        Alice:
+                          profile:
+                            role: hero
+                    """,
+                },
+            )
+            self.assertEqual("completed", result["status"])
+            self.assertEqual(["0001"], result["processed_batches"])
 
     def test_generate_yaml_fails_when_epub_has_no_chapters(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
