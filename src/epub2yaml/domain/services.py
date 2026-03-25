@@ -60,9 +60,34 @@ def build_batches(chapters: list[Chapter], *, target_input_tokens: int, max_inpu
     return batches
 
 
+def _unwrap_markdown_code_fence(text: str) -> str:
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return text
+
+    lines = stripped.splitlines()
+    if len(lines) < 2:
+        return text
+
+    if not lines[0].startswith("```"):
+        return text
+
+    closing_index: int | None = None
+    for index in range(len(lines) - 1, 0, -1):
+        if lines[index].strip().startswith("```"):
+            closing_index = index
+            break
+
+    if closing_index is None:
+        return text
+
+    return "\n".join(lines[1:closing_index]).strip()
+
+
 def parse_delta_yaml(delta_yaml: str) -> DeltaPackage:
+    normalized_yaml = _unwrap_markdown_code_fence(delta_yaml)
     try:
-        parsed = yaml.safe_load(delta_yaml) or {}
+        parsed = yaml.safe_load(normalized_yaml) or {}
     except yaml.YAMLError as exc:
         raise ValueError(f"Delta YAML 解析失败: {exc}") from exc
 
@@ -85,8 +110,9 @@ def parse_delta_yaml(delta_yaml: str) -> DeltaPackage:
 
 
 def parse_yaml_mapping_document(document_text: str, *, root_key: str) -> dict[str, Any]:
+    normalized_yaml = _unwrap_markdown_code_fence(document_text)
     try:
-        payload = yaml.safe_load(document_text) or {}
+        payload = yaml.safe_load(normalized_yaml) or {}
     except yaml.YAMLError as exc:
         raise ValueError(f"{root_key}.yaml 解析失败: {exc}") from exc
 

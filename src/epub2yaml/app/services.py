@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from epub2yaml.domain.enums import BatchStatus, ReviewAction, RunStatus
 from epub2yaml.domain.models import BatchRecord, DocumentVersion, ReviewDecision, RunState
@@ -92,7 +92,13 @@ class PipelineService:
             raise ValueError(pipeline_state.error_message or "批次处理失败")
         return record
 
-    def run_to_completion(self, book_id: str, *, delta_yaml_by_batch: dict[str, str] | None = None) -> dict[str, Any]:
+    def run_to_completion(
+        self,
+        book_id: str,
+        *,
+        delta_yaml_by_batch: dict[str, str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         run_dir = self.runs_dir / book_id
         state_store = StateStore(run_dir)
         processed_batches: list[str] = []
@@ -105,12 +111,37 @@ class PipelineService:
                 break
 
             next_batch_id = self._predict_next_batch_id(run_state)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "batch_started",
+                        "book_id": book_id,
+                        "batch_id": next_batch_id,
+                        "processed_batches": len(processed_batches),
+                        "total_chapters": run_state.total_chapters,
+                        "next_chapter_index": run_state.next_chapter_index,
+                    }
+                )
+
             record = self.process_next_batch(
                 book_id,
                 delta_yaml_text=(delta_yaml_by_batch or {}).get(next_batch_id),
             )
             self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
             processed_batches.append(record.batch.batch_id)
+
+            latest_state = state_store.load_run_state()
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "batch_completed",
+                        "book_id": book_id,
+                        "batch_id": record.batch.batch_id,
+                        "processed_batches": len(processed_batches),
+                        "total_chapters": latest_state.total_chapters,
+                        "next_chapter_index": latest_state.next_chapter_index,
+                    }
+                )
 
         final_state = state_store.load_run_state()
         actors_path = run_dir / "current" / "actors.yaml"
@@ -129,9 +160,23 @@ class PipelineService:
         *,
         book_id: str | None = None,
         delta_yaml_by_batch: dict[str, str] | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         run_state = self.init_run(epub_path, book_id=book_id)
-        result = self.run_to_completion(run_state.book_id, delta_yaml_by_batch=delta_yaml_by_batch)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "event": "run_initialized",
+                    "book_id": run_state.book_id,
+                    "total_chapters": run_state.total_chapters,
+                    "next_chapter_index": run_state.next_chapter_index,
+                }
+            )
+        result = self.run_to_completion(
+            run_state.book_id,
+            delta_yaml_by_batch=delta_yaml_by_batch,
+            progress_callback=progress_callback,
+        )
         result["total_chapters"] = run_state.total_chapters
         return result
 
