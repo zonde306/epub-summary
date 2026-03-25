@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -119,6 +120,54 @@ class LangChainAndLangGraphTests(unittest.TestCase):
             self.assertTrue((batch_dir / "raw_output.md").exists())
             self.assertTrue((batch_dir / "delta.yaml").exists())
             self.assertTrue((batch_dir / "merged_actors.preview.yaml").exists())
+            self.assertTrue((batch_dir / "structure_check.json").exists())
+
+    def test_run_batch_generation_workflow_writes_structure_loss_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "book.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="workflow-loss-book")
+
+            run_dir = workspace_dir / "runs" / "workflow-loss-book"
+            (run_dir / "current" / "actors.yaml").write_text(
+                "actors:\n  Alice:\n    profile:\n      goals:\n        short_term: 保护妹妹\n",
+                encoding="utf-8",
+            )
+            (run_dir / "current" / "worldinfo.yaml").write_text(
+                "worldinfo:\n  MagicSystem:\n    rules:\n      cost: 高\n",
+                encoding="utf-8",
+            )
+
+            state = run_batch_generation_workflow(
+                run_dir=run_dir,
+                book_id="workflow-loss-book",
+                document_update_chain=None,
+                llm_raw_output="""
+                delta:
+                  actors:
+                    Alice:
+                      profile: null
+                  worldinfo:
+                    MagicSystem:
+                      rules: null
+                """,
+            )
+
+            self.assertFalse(state.structure_check_passed)
+            self.assertTrue(state.requires_loss_approval)
+            batch_dir = run_dir / "batches" / "0001"
+            structure_payload = json.loads((batch_dir / "structure_check.json").read_text(encoding="utf-8"))
+            self.assertEqual(3, structure_payload["missing_paths_count"])
+            missing_paths_text = (batch_dir / "missing_paths.txt").read_text(encoding="utf-8")
+            self.assertIn("Alice.profile.goals", missing_paths_text)
+            self.assertIn("MagicSystem.rules.cost", missing_paths_text)
 
     def test_pipeline_service_can_generate_delta_via_langchain_model(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

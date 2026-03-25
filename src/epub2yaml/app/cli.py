@@ -81,6 +81,9 @@ def process_next_batch(
 def resume_run(book_id: str = typer.Argument(..., help="书籍 ID")) -> None:
     service = PipelineService(get_workspace_dir())
     decision = service.resume_run(book_id)
+    if decision.action == "review_structure_loss" and decision.batch_id is not None:
+        summary = service.get_review_batch_summary(book_id, batch_id=decision.batch_id)
+        typer.echo(f"[待审批] 批次 {decision.batch_id} 存在结构缺失，缺失路径数={summary['missing_paths_count']}")
     _echo_json(decision.model_dump(mode="json"))
 
 
@@ -123,6 +126,35 @@ def review_batch(
     edited_worldinfo_file: Optional[Path] = typer.Option(None, "--edited-worldinfo-file", exists=True, file_okay=True, dir_okay=False, readable=True, help="人工修改后的 worldinfo 预览文件"),
 ) -> None:
     service = PipelineService(get_workspace_dir())
+    summary = service.get_review_batch_summary(book_id, batch_id=batch_id)
+    typer.echo(f"Batch: {summary['batch_id']}")
+    typer.echo(f"Chapters: {summary['chapter_start'] + 1}-{summary['chapter_end'] + 1}")
+    typer.echo(f"Status: {summary['status']}")
+    typer.echo(f"Retry Count: {summary['retry_count']}")
+    typer.echo(f"Structure loss detected: {'yes' if summary['requires_loss_approval'] else 'no'}")
+    typer.echo(f"Missing paths: {summary['missing_paths_count']}")
+    typer.echo(f"Actors missing: {summary['actors_missing_count']}")
+    typer.echo(f"Worldinfo missing: {summary['worldinfo_missing_count']}")
+    if summary['requires_loss_approval']:
+        typer.echo("WARNING: 当前结果相较上一版正式文档存在字段缺失。")
+        typer.echo("WARNING: accept 表示人工确认允许当前缺失结果继续提交。")
+        for path in summary["actors_missing_paths"][:10]:
+            typer.echo(f"- ACTORS {path}")
+        for path in summary["worldinfo_missing_paths"][:10]:
+            typer.echo(f"- WORLDINFO {path}")
+        if summary["missing_paths_count"] > 20:
+            typer.echo("更多缺失路径请查看 structure_check.json 或 missing_paths.txt")
+    typer.echo("Files:")
+    typer.echo(f"- {summary['files']['delta']}")
+    typer.echo(f"- {summary['files']['merged_actors_preview']}")
+    typer.echo(f"- {summary['files']['merged_worldinfo_preview']}")
+    typer.echo(f"- {summary['files']['structure_check']}")
+    typer.echo(f"- {summary['files']['missing_paths']}")
+    typer.echo("Actions:")
+    typer.echo("- accept: accept and continue")
+    typer.echo("- reject: reject and retry later")
+    typer.echo("- edit: edit preview before commit")
+
     decision = service.review_batch(
         book_id=book_id,
         batch_id=batch_id,

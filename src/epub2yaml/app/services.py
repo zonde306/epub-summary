@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 from epub2yaml.domain.enums import BatchStatus, ReviewAction, RunStatus
 from epub2yaml.domain.models import BatchRecord, DocumentVersion, FailureInfo, RecoveryDecision, ReviewDecision, RunState
-from epub2yaml.domain.services import parse_yaml_mapping_document
+from epub2yaml.domain.services import detect_structure_loss, parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
@@ -93,6 +94,12 @@ class PipelineService:
             status=pipeline_state.batch_record_status or "unknown",
             validation_errors=pipeline_state.validation_errors,
             retry_count=pipeline_state.retry_count,
+            structure_check_passed=pipeline_state.structure_check_passed,
+            missing_paths=pipeline_state.missing_paths,
+            actors_missing_paths=pipeline_state.actors_missing_paths,
+            worldinfo_missing_paths=pipeline_state.worldinfo_missing_paths,
+            requires_loss_approval=pipeline_state.requires_loss_approval,
+            loss_approval_status="pending" if pipeline_state.requires_loss_approval else None,
         )
         if record.status == BatchStatus.FAILED:
             raise ValueError(pipeline_state.error_message or "批次处理失败")
@@ -133,6 +140,8 @@ class PipelineService:
                     }
                 )
 
+            if decision.action == "review_structure_loss":
+                raise ValueError(f"批次 {target_batch_id} 检测到结构缺失，必须先人工审阅")
             if decision.action == "resume_pending_review":
                 self.commit_batch(book_id, batch_id=target_batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
                 processed_batches.append(target_batch_id)
@@ -142,6 +151,8 @@ class PipelineService:
                     batch_id=target_batch_id,
                     delta_yaml_text=(delta_yaml_by_batch or {}).get(target_batch_id),
                 )
+                if record.requires_loss_approval:
+                    raise ValueError(f"批次 {record.batch.batch_id} 检测到结构缺失，必须先人工审阅")
                 self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
                 processed_batches.append(record.batch.batch_id)
             elif decision.action == "continue_new_batch":
@@ -149,6 +160,8 @@ class PipelineService:
                     book_id,
                     delta_yaml_text=(delta_yaml_by_batch or {}).get(target_batch_id),
                 )
+                if record.requires_loss_approval:
+                    raise ValueError(f"批次 {record.batch.batch_id} 检测到结构缺失，必须先人工审阅")
                 self.commit_batch(book_id, batch_id=record.batch.batch_id, action=ReviewAction.ACCEPT, reviewer="system-auto")
                 processed_batches.append(record.batch.batch_id)
             else:
@@ -280,6 +293,12 @@ class PipelineService:
             status=pipeline_state.batch_record_status or "unknown",
             validation_errors=pipeline_state.validation_errors,
             retry_count=pipeline_state.retry_count,
+            structure_check_passed=pipeline_state.structure_check_passed,
+            missing_paths=pipeline_state.missing_paths,
+            actors_missing_paths=pipeline_state.actors_missing_paths,
+            worldinfo_missing_paths=pipeline_state.worldinfo_missing_paths,
+            requires_loss_approval=pipeline_state.requires_loss_approval,
+            loss_approval_status="pending" if pipeline_state.requires_loss_approval else None,
         )
 
     def commit_batch(
@@ -315,6 +334,9 @@ class PipelineService:
         if action is ReviewAction.REJECT:
             record.status = BatchStatus.REJECTED
             record.review_decision = decision
+            if record.requires_loss_approval:
+                record.loss_approval_status = "rejected"
+                record.loss_approval_comment = comment
             record.last_failure = FailureInfo(
                 stage="review",
                 message=comment or "审阅拒绝",
@@ -329,6 +351,7 @@ class PipelineService:
             state_store.append_checkpoint("batch_rejected", {"batch_id": batch_id})
             run_state.status = RunStatus.RUNNING
             run_state.pending_review_batch_id = None
+            run_state.pending_loss_review_batch_id = None
             run_state.last_failed_batch_id = batch_id
             run_state.last_failed_stage = "review"
             run_state.last_failure_reason = record.last_failure.message
@@ -342,6 +365,68 @@ class PipelineService:
         worldinfo_text = edited_worldinfo_text or batch_store.read_text_artifact(batch_id, "merged_worldinfo.preview.yaml")
         actors_content = parse_yaml_mapping_document(actors_text, root_key="actors")
         worldinfo_content = parse_yaml_mapping_document(worldinfo_text, root_key="worldinfo")
+
+        previous_actors_text = (run_dir / "current" / "actors.yaml").read_text(encoding="utf-8")
+        previous_worldinfo_text = (run_dir / "current" / "worldinfo.yaml").read_text(encoding="utf-8")
+        structure_result = detect_structure_loss(
+            previous_actors_document=previous_actors_text,
+            current_actors_document=actors_text,
+            previous_worldinfo_document=previous_worldinfo_text,
+            current_worldinfo_document=worldinfo_text,
+        )
+        current_missing_paths = list(structure_result["missing_paths"])
+        current_actors_missing_paths = list(structure_result["actors_missing_paths"])
+        current_worldinfo_missing_paths = list(structure_result["worldinfo_missing_paths"])
+        current_requires_loss_approval = bool(structure_result["requires_loss_approval"])
+        if current_requires_loss_approval and action is not ReviewAction.ACCEPT:
+            raise ValueError("存在结构缺失时，仅允许 accept 继续提交或 reject 进入重试")
+        if current_requires_loss_approval and action is ReviewAction.ACCEPT and not reviewer:
+            reviewer = "manual-review"
+
+        record.structure_check_passed = bool(structure_result["structure_check_passed"])
+        record.missing_paths = current_missing_paths
+        record.actors_missing_paths = current_actors_missing_paths
+        record.worldinfo_missing_paths = current_worldinfo_missing_paths
+        record.requires_loss_approval = current_requires_loss_approval
+        if current_requires_loss_approval:
+            record.loss_approval_status = "approved_after_edit" if edited_actors_text or edited_worldinfo_text else "approved"
+            record.loss_approval_comment = comment
+        else:
+            record.loss_approval_status = None
+            record.loss_approval_comment = None
+
+        batch_store.write_text_artifact(batch_id, "merged_actors.preview.yaml", actors_text)
+        batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", worldinfo_text)
+        batch_store.write_text_artifact(
+            batch_id,
+            "structure_check.json",
+            json.dumps(
+                {
+                    "checked_at": datetime.utcnow().isoformat(),
+                    "batch_id": batch_id,
+                    "baseline": {
+                        "actors": "current/actors.yaml",
+                        "worldinfo": "current/worldinfo.yaml",
+                    },
+                    "preview": {
+                        "actors": f"batches/{batch_id}/merged_actors.preview.yaml",
+                        "worldinfo": f"batches/{batch_id}/merged_worldinfo.preview.yaml",
+                    },
+                    "structure_check_passed": record.structure_check_passed,
+                    "requires_loss_approval": record.requires_loss_approval,
+                    "missing_paths_count": len(record.missing_paths),
+                    "actors_missing_paths": record.actors_missing_paths,
+                    "worldinfo_missing_paths": record.worldinfo_missing_paths,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+        batch_store.write_text_artifact(
+            batch_id,
+            "missing_paths.txt",
+            "\n".join(record.missing_paths) + ("\n" if record.missing_paths else ""),
+        )
 
         actors_version = run_state.current_actors_version + 1
         worldinfo_version = run_state.current_worldinfo_version + 1
@@ -393,6 +478,10 @@ class PipelineService:
                 "batch_id": batch_id,
                 "actors_current": str(actors_current_path.relative_to(run_dir)),
                 "worldinfo_current": str(worldinfo_current_path.relative_to(run_dir)),
+                "structure_check_passed": record.structure_check_passed,
+                "requires_loss_approval": record.requires_loss_approval,
+                "missing_paths_count": len(record.missing_paths),
+                "loss_approval_status": record.loss_approval_status,
             },
         )
 
@@ -408,10 +497,13 @@ class PipelineService:
         run_state.next_chapter_index = chapter_end + 1
         run_state.status = RunStatus.COMPLETED if run_state.next_chapter_index >= run_state.total_chapters else RunStatus.RUNNING
         run_state.pending_review_batch_id = None
+        run_state.pending_loss_review_batch_id = None
         run_state.last_failed_batch_id = None
         run_state.last_failed_stage = None
         run_state.last_failure_reason = None
         run_state.last_failure_retryable = None
+        run_state.last_structure_check_batch_id = batch_id
+        run_state.last_structure_check_passed = record.structure_check_passed
         run_state.recommended_action = "completed" if run_state.status == RunStatus.COMPLETED else "continue_new_batch"
         state_store.save_run_state(run_state)
         return decision
@@ -429,9 +521,12 @@ class PipelineService:
             "last_accepted_batch_id": run_state.last_accepted_batch_id,
             "last_generated_batch_id": run_state.last_generated_batch_id,
             "pending_review_batch_id": run_state.pending_review_batch_id,
+            "pending_loss_review_batch_id": run_state.pending_loss_review_batch_id,
             "last_failed_batch_id": run_state.last_failed_batch_id,
             "last_failed_stage": run_state.last_failed_stage,
             "last_failure_reason": run_state.last_failure_reason,
+            "last_structure_check_batch_id": run_state.last_structure_check_batch_id,
+            "last_structure_check_passed": run_state.last_structure_check_passed,
             "recommended_action": recovery_decision.action,
             "actors_version": run_state.current_actors_version,
             "worldinfo_version": run_state.current_worldinfo_version,
@@ -440,17 +535,23 @@ class PipelineService:
     def get_recovery_decision(self, book_id: str) -> RecoveryDecision:
         run_dir = self.runs_dir / book_id
         state_store = StateStore(run_dir)
+        review_store = ReviewQueueStore(run_dir)
         run_state = state_store.load_run_state()
         pending_record = state_store.find_pending_review_batch(run_state)
         if pending_record is not None:
+            review_entry = review_store.get_entry(pending_record.batch.batch_id) or {}
+            review_kind = review_entry.get("review_kind", "normal_review")
+            action = "review_structure_loss" if pending_record.requires_loss_approval else "resume_pending_review"
+            reason = "存在结构缺失待审批批次" if pending_record.requires_loss_approval else "存在待审阅批次"
             return RecoveryDecision(
-                action="resume_pending_review",
+                action=action,
                 batch_id=pending_record.batch.batch_id,
-                reason="存在待审阅批次",
+                reason=reason,
                 run_status=run_state.status,
                 next_chapter_index=run_state.next_chapter_index,
                 total_chapters=run_state.total_chapters,
                 batch_status=pending_record.status,
+                review_kind=review_kind,
             )
 
         failed_record = state_store.find_retryable_failed_batch(run_state)
@@ -465,6 +566,7 @@ class PipelineService:
                 next_chapter_index=run_state.next_chapter_index,
                 total_chapters=run_state.total_chapters,
                 batch_status=failed_record.status,
+                review_kind="structure_loss_review" if failed_record.requires_loss_approval else "normal_review",
             )
 
         if run_state.next_chapter_index < run_state.total_chapters:
@@ -484,6 +586,39 @@ class PipelineService:
             next_chapter_index=run_state.next_chapter_index,
             total_chapters=run_state.total_chapters,
         )
+
+    def get_review_batch_summary(self, book_id: str, *, batch_id: str) -> dict[str, Any]:
+        run_dir = self.runs_dir / book_id
+        state_store = StateStore(run_dir)
+        review_store = ReviewQueueStore(run_dir)
+        record = state_store.load_batch_record(batch_id)
+        if record is None:
+            raise ValueError(f"批次 {batch_id} 不存在")
+        review_entry = review_store.get_entry(batch_id) or {}
+        return {
+            "batch_id": batch_id,
+            "chapter_start": record.batch.start_chapter_index,
+            "chapter_end": record.batch.end_chapter_index,
+            "status": record.status,
+            "retry_count": record.retry_count,
+            "structure_check_passed": record.structure_check_passed,
+            "requires_loss_approval": record.requires_loss_approval,
+            "loss_approval_status": record.loss_approval_status,
+            "missing_paths_count": len(record.missing_paths),
+            "actors_missing_count": len(record.actors_missing_paths),
+            "worldinfo_missing_count": len(record.worldinfo_missing_paths),
+            "actors_missing_paths": record.actors_missing_paths,
+            "worldinfo_missing_paths": record.worldinfo_missing_paths,
+            "missing_paths": record.missing_paths,
+            "review_kind": review_entry.get("review_kind", "normal_review"),
+            "files": {
+                "delta": f"runs/{book_id}/batches/{batch_id}/delta.yaml",
+                "merged_actors_preview": f"runs/{book_id}/batches/{batch_id}/merged_actors.preview.yaml",
+                "merged_worldinfo_preview": f"runs/{book_id}/batches/{batch_id}/merged_worldinfo.preview.yaml",
+                "structure_check": f"runs/{book_id}/batches/{batch_id}/structure_check.json",
+                "missing_paths": f"runs/{book_id}/batches/{batch_id}/missing_paths.txt",
+            },
+        }
 
     @staticmethod
     def _predict_next_batch_id(run_state: RunState) -> str:
