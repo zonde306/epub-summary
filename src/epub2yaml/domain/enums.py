@@ -1,9 +1,13 @@
 from __future__ import annotations
 
-from enum import StrEnum
+from enum import Enum
 
 
-class BatchStatus(StrEnum):
+class StringEnum(str, Enum):
+    pass
+
+
+class BatchStatus(StringEnum):
     PENDING = "pending"
     GENERATED_DELTA = "generated_delta"
     MERGED_PREVIEW_READY = "merged_preview_ready"
@@ -14,7 +18,7 @@ class BatchStatus(StrEnum):
     FAILED = "failed"
 
 
-class RunStatus(StrEnum):
+class RunStatus(StringEnum):
     INITIALIZED = "initialized"
     RUNNING = "running"
     REVIEW_REQUIRED = "review_required"
@@ -22,7 +26,7 @@ class RunStatus(StrEnum):
     FAILED = "failed"
 
 
-class ReviewAction(StrEnum):
+class ReviewAction(StringEnum):
     ACCEPT = "accept"
     REJECT = "reject"
     EDIT = "edit"
