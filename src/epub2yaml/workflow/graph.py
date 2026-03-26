@@ -7,7 +7,7 @@ from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
-from epub2yaml.domain.enums import BatchStatus, RunStatus
+from epub2yaml.domain.enums import BatchStatus, ControlAction, RunStatus
 from epub2yaml.domain.models import BatchRecord, ChapterBatch, DeltaPackage, FailureInfo, PipelineState
 from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package_with_warnings, parse_delta_yaml, parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
@@ -61,6 +61,13 @@ class PipelineWorkflowContext:
     document_update_chain: DocumentUpdateChain | None = None
 
 
+class WorkflowControlInterrupt(RuntimeError):
+    def __init__(self, action: str, batch_id: str | None) -> None:
+        self.action = action
+        self.batch_id = batch_id
+        super().__init__(f"workflow interrupted by control action: {action} batch={batch_id}")
+
+
 def build_pipeline_graph(context: PipelineWorkflowContext):
     graph = StateGraph(GraphState)
     graph.add_node("load_run_state", _load_run_state(context))
@@ -70,9 +77,9 @@ def build_pipeline_graph(context: PipelineWorkflowContext):
     graph.add_node("build_filtered_context", _build_filtered_context(context))
     graph.add_node("build_prompt", _build_prompt(context))
     graph.add_node("invoke_llm", _invoke_llm(context))
-    graph.add_node("parse_delta_output", _parse_delta_output())
+    graph.add_node("parse_delta_output", _parse_delta_output(context))
     graph.add_node("merge_delta_preview", _merge_delta_preview(context))
-    graph.add_node("validate_merged_preview", _validate_merged_preview())
+    graph.add_node("validate_merged_preview", _validate_merged_preview(context))
     graph.add_node("enqueue_review", _enqueue_review(context))
     graph.add_node("handle_failure", _handle_failure(context))
 
@@ -208,6 +215,7 @@ def _prepare_batch(context: PipelineWorkflowContext):
             run_state.last_recovery_action = "retry_batch"
             run_state.last_recovery_batch_id = batch.batch_id
             context.state_store.save_run_state(run_state)
+            _interrupt_if_control_requested(context, batch.batch_id)
             return {
                 "batch_id": batch.batch_id,
                 "batch": batch.model_dump(mode="python"),
@@ -240,6 +248,7 @@ def _prepare_batch(context: PipelineWorkflowContext):
         run_state.last_recovery_action = "continue_new_batch"
         run_state.last_recovery_batch_id = batch.batch_id
         context.state_store.save_run_state(run_state)
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "batch_id": batch.batch_id,
             "batch": batch.model_dump(mode="python"),
@@ -250,8 +259,10 @@ def _prepare_batch(context: PipelineWorkflowContext):
 
 def _load_current_documents(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
+        batch = _require_batch(state)
         actors_current = context.yaml_store.load_document("actors")
         worldinfo_current = context.yaml_store.load_document("worldinfo")
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "actors_current": dump_yaml_document("actors", actors_current),
             "worldinfo_current": dump_yaml_document("worldinfo", worldinfo_current),
@@ -300,6 +311,7 @@ def _build_filtered_context(context: PipelineWorkflowContext):
                 "warnings": len(summary.get("warnings", [])),
             },
         )
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "filtered_actors_yaml": filtered_actors_yaml,
             "filtered_worldinfo_yaml": filtered_worldinfo_yaml,
@@ -340,6 +352,7 @@ def _build_prompt(context: PipelineWorkflowContext):
                 "prompt_length": len(prompt_text),
             },
         )
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "prompt_text": prompt_text,
             "validation_errors": [],
@@ -390,6 +403,7 @@ def _invoke_llm(context: PipelineWorkflowContext):
                 "output_length": len(raw_output),
             },
         )
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "prompt_text": state.get("prompt_text"),
             "llm_raw_output": raw_output,
@@ -400,8 +414,9 @@ def _invoke_llm(context: PipelineWorkflowContext):
     return node
 
 
-def _parse_delta_output():
+def _parse_delta_output(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
+        batch_id = state.get("batch_id")
         raw_output = state.get("llm_raw_output")
         if raw_output is None:
             message = "缺少 LLM 原始输出"
@@ -425,6 +440,7 @@ def _parse_delta_output():
                 "suggested_action": "retry_batch",
             }
 
+        _interrupt_if_control_requested(context, batch_id)
         return {
             "delta_yaml": raw_output,
             "actors_delta": delta_package.actors,
@@ -438,6 +454,7 @@ def _parse_delta_output():
 
 def _merge_delta_preview(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
+        batch = _require_batch(state)
         actors_current = context.yaml_store.load_document("actors")
         worldinfo_current = context.yaml_store.load_document("worldinfo")
         delta_package = DeltaPackage(
@@ -456,6 +473,7 @@ def _merge_delta_preview(context: PipelineWorkflowContext):
                 "suggested_action": "fix_delta_or_merge_rules",
             }
 
+        _interrupt_if_control_requested(context, batch.batch_id)
         return {
             "actors_merged_preview": dump_yaml_document("actors", merge_result.actors),
             "worldinfo_merged_preview": dump_yaml_document("worldinfo", merge_result.worldinfo),
@@ -467,7 +485,7 @@ def _merge_delta_preview(context: PipelineWorkflowContext):
     return node
 
 
-def _validate_merged_preview():
+def _validate_merged_preview(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
         errors: list[str] = []
         for root_key, content in (
@@ -488,6 +506,7 @@ def _validate_merged_preview():
                 "failure_retryable": True,
                 "suggested_action": "retry_batch",
             }
+        _interrupt_if_control_requested(context, state.get("batch_id"))
         return {
             "validation_errors": [],
             "error_message": None,
@@ -507,6 +526,7 @@ def _enqueue_review(context: PipelineWorkflowContext):
         context.batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", state.get("worldinfo_merged_preview") or "worldinfo: {}\n")
         context.batch_store.write_text_artifact(batch_id, "filtered_context_summary.json", state.get("filtered_context_summary") or "{}\n")
         context.batch_store.write_text_artifact(batch_id, "merge_warnings.json", state.get("merge_warnings") or "[]\n")
+        _interrupt_if_control_requested(context, batch_id)
 
         record = BatchRecord(
             batch=batch,
@@ -627,6 +647,27 @@ def _require_batch(state: GraphState) -> ChapterBatch:
     if isinstance(batch, ChapterBatch):
         return batch
     return ChapterBatch.model_validate(batch)
+
+
+def _interrupt_if_control_requested(context: PipelineWorkflowContext, batch_id: str | None) -> None:
+    if not batch_id:
+        return
+    run_state = context.state_store.load_run_state()
+    if run_state.control_action not in {ControlAction.PAUSE.value, ControlAction.PREPARE_MANUAL_EDIT.value}:
+        return
+    run_state.last_generated_batch_id = batch_id
+    run_state.last_recovery_batch_id = batch_id
+    if run_state.control_action == ControlAction.PREPARE_MANUAL_EDIT.value:
+        run_state.manual_edit_batch_id = batch_id
+    context.state_store.save_run_state(run_state)
+    context.state_store.append_checkpoint(
+        "control_interrupt_requested",
+        {
+            "batch_id": batch_id,
+            "control_action": run_state.control_action,
+        },
+    )
+    raise WorkflowControlInterrupt(run_state.control_action, batch_id)
 
 
 def _select_filtered_context(chapter_text: str, actors_current: dict[str, Any], worldinfo_current: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:

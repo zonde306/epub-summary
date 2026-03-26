@@ -8,8 +8,25 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from epub2yaml.app.editor import EditorLaunchResult
 from epub2yaml.app.services import PipelineService
-from epub2yaml.domain.enums import ReviewAction
+from epub2yaml.domain.enums import ControlAction, ReviewAction
+
+
+class StubEditorLauncher:
+    def __init__(self, *, exit_code: int | None = 0, error: str | None = None) -> None:
+        self.exit_code = exit_code
+        self.error = error
+        self.opened_files: list[str] = []
+
+    def open(self, file_path: Path) -> EditorLaunchResult:
+        self.opened_files.append(str(file_path))
+        return EditorLaunchResult(
+            command=f'notepad "{file_path}"',
+            exit_code=self.exit_code,
+            waited=True,
+            error=self.error,
+        )
 
 
 class PipelineServiceTests(unittest.TestCase):
@@ -199,6 +216,165 @@ class PipelineServiceTests(unittest.TestCase):
             self.assertEqual("0001", retried_record.batch.batch_id)
             self.assertEqual(1, retried_record.retry_count)
             self.assertEqual("review_required", retried_record.status)
+
+    def test_prepare_manual_edit_exports_workspace_and_marks_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            editor = StubEditorLauncher()
+            service = PipelineService(workspace_dir, editor_launcher=editor)
+            epub_path = workspace_dir / "manual.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="manual-book")
+
+            session = service.prepare_manual_edit("manual-book", open_editor=False)
+            run_dir = workspace_dir / "runs" / "manual-book"
+            actors_path = run_dir / "manual_edit" / "actors.editable.yaml"
+            worldinfo_path = run_dir / "manual_edit" / "worldinfo.editable.yaml"
+            self.assertEqual("0001", session.batch_id)
+            self.assertTrue(actors_path.exists())
+            self.assertTrue(worldinfo_path.exists())
+            status = service.show_status("manual-book")
+            self.assertTrue(status["awaiting_manual_edit"])
+            self.assertEqual("await_manual_edit", status["recommended_action"])
+            self.assertEqual("manual_edit", status["manual_edit_workspace"])
+
+    def test_apply_manual_edit_and_continue_reuses_same_batch_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            editor = StubEditorLauncher()
+            service = PipelineService(workspace_dir, editor_launcher=editor)
+            epub_path = workspace_dir / "manual-continue.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="manual-continue-book")
+
+            service.prepare_manual_edit("manual-continue-book", open_editor=False)
+            run_dir = workspace_dir / "runs" / "manual-continue-book"
+            (run_dir / "manual_edit" / "actors.editable.yaml").write_text(
+                """
+                actors:
+                  Alice:
+                    profile:
+                      role: baseline
+                """,
+                encoding="utf-8",
+            )
+            (run_dir / "manual_edit" / "worldinfo.editable.yaml").write_text(
+                """
+                worldinfo:
+                  Academy:
+                    content: baseline
+                """,
+                encoding="utf-8",
+            )
+
+            applied = service.apply_manual_edit_session("manual-continue-book")
+            self.assertEqual("applied", applied.status)
+            decision = service.get_recovery_decision("manual-continue-book")
+            self.assertEqual("continue_after_manual_edit", decision.action)
+            self.assertEqual("0001", decision.batch_id)
+
+            record = service.continue_after_manual_edit(
+                "manual-continue-book",
+                delta_yaml_text="""
+                delta:
+                  actors:
+                    Alice:
+                      profile:
+                        role: merged
+                  worldinfo:
+                    Academy:
+                      content: merged
+                """,
+            )
+            self.assertEqual("0001", record.batch.batch_id)
+            self.assertEqual("review_required", record.status)
+
+    def test_pause_interrupts_running_workflow_at_control_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "pause.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="pause-book")
+
+            def callback(event: dict[str, object]) -> None:
+                if event.get("event") == "batch_started":
+                    service.request_control_action("pause-book", ControlAction.PAUSE)
+
+            result = service.run_to_completion(
+                "pause-book",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      actors:
+                        Alice:
+                          profile:
+                            role: hero
+                    """,
+                },
+                progress_callback=callback,
+            )
+
+            self.assertEqual("paused", result["status"])
+            status = service.show_status("pause-book")
+            self.assertEqual("paused", status["status"])
+            self.assertEqual("pause-book", status["book_id"])
+            self.assertEqual("paused", status["recommended_action"])
+
+    def test_prepare_manual_edit_interrupts_running_workflow_and_exports_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            editor = StubEditorLauncher(exit_code=1)
+            service = PipelineService(workspace_dir, editor_launcher=editor)
+            epub_path = workspace_dir / "interrupt-manual.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 8),
+                ]
+                service.init_run(epub_path, book_id="interrupt-manual-book")
+
+            def callback(event: dict[str, object]) -> None:
+                if event.get("event") == "batch_started":
+                    service.request_control_action("interrupt-manual-book", ControlAction.PREPARE_MANUAL_EDIT)
+
+            result = service.run_to_completion(
+                "interrupt-manual-book",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      actors:
+                        Alice:
+                          profile:
+                            role: hero
+                    """,
+                },
+                progress_callback=callback,
+            )
+
+            self.assertEqual("awaiting_manual_edit", result["status"])
+            run_dir = workspace_dir / "runs" / "interrupt-manual-book"
+            self.assertTrue((run_dir / "manual_edit" / "actors.editable.yaml").exists())
+            self.assertTrue((run_dir / "manual_edit" / "worldinfo.editable.yaml").exists())
+            status = service.show_status("interrupt-manual-book")
+            self.assertTrue(status["awaiting_manual_edit"])
+            self.assertEqual("await_manual_edit", status["recommended_action"])
 
     @staticmethod
     def _chapter(index: int, title: str, source_href: str, content_text: str, estimated_tokens: int):

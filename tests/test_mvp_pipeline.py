@@ -10,6 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from epub2yaml.app.services import PipelineService
+from epub2yaml.domain.enums import ControlAction
 from epub2yaml.domain.models import Chapter
 from epub2yaml.utils.hashing import sha256_text
 
@@ -267,6 +268,24 @@ class MVPPipelineTests(unittest.TestCase):
             self.assertEqual("completed", result["status"])
             warnings = json.loads((run_dir / "batches" / "0001" / "merge_warnings.json").read_text(encoding="utf-8"))
             self.assertEqual("object_array_replace_fallback", warnings[0]["code"])
+
+    def test_run_to_completion_stops_when_pause_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "pause.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "内容", 5),
+                ]
+                service.init_run(epub_path, book_id="pause-book")
+
+            service.request_control_action("pause-book", ControlAction.PAUSE)
+            result = service.run_to_completion("pause-book", delta_yaml_by_batch={"0001": "delta:\n  actors: {}"})
+            self.assertEqual("paused", result["status"])
+            self.assertEqual([], result["processed_batches"])
 
     @staticmethod
     def _chapter(index: int, title: str, source_href: str, content_text: str, estimated_tokens: int) -> Chapter:

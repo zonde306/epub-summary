@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from epub2yaml.domain.enums import BatchStatus
-from epub2yaml.domain.models import BatchRecord, Chapter, ChapterBatch, DocumentVersion, ReviewDecision, RunState
+from epub2yaml.domain.models import BatchRecord, Chapter, ChapterBatch, DocumentVersion, ManualEditSession, ReviewDecision, RunState
 
 
 class StateStore:
@@ -15,9 +15,11 @@ class StateStore:
         self.state_dir = run_dir / "state"
         self.extracted_dir = run_dir / "extracted"
         self.batches_dir = run_dir / "batches"
+        self.manual_edit_dir = run_dir / "manual_edit"
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.extracted_dir.mkdir(parents=True, exist_ok=True)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
+        self.manual_edit_dir.mkdir(parents=True, exist_ok=True)
 
     def save_run_state(self, run_state: RunState) -> Path:
         run_state.updated_at = datetime.utcnow()
@@ -29,6 +31,32 @@ class StateStore:
         path = self.state_dir / "run_state.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
         return RunState.model_validate(payload)
+
+    def request_control_action(self, action: str) -> Path:
+        run_state = self.load_run_state()
+        run_state.control_action = action
+        run_state.control_requested_at = datetime.utcnow()
+        return self.save_run_state(run_state)
+
+    def clear_control_action(self) -> Path:
+        run_state = self.load_run_state()
+        run_state.control_action = None
+        run_state.control_requested_at = None
+        return self.save_run_state(run_state)
+
+    def save_manual_edit_session(self, session: ManualEditSession) -> Path:
+        path = self.manual_edit_dir / "active_session.json"
+        path.write_text(session.model_dump_json(indent=2), encoding="utf-8")
+        return path
+
+    def load_manual_edit_session(self) -> ManualEditSession | None:
+        path = self.manual_edit_dir / "active_session.json"
+        if not path.exists():
+            return None
+        return ManualEditSession.model_validate(json.loads(path.read_text(encoding="utf-8")))
+
+    def get_manual_edit_workspace_dir(self) -> Path:
+        return self.manual_edit_dir
 
     def save_chapters(self, chapters: list[Chapter]) -> Path:
         path = self.extracted_dir / "chapters.jsonl"
@@ -110,6 +138,29 @@ class StateStore:
 
         for record in reversed(self.list_batch_records()):
             if record.status == BatchStatus.REVIEW_REQUIRED:
+                return record
+        return None
+
+    def find_manual_edit_batch(self, run_state: RunState | None = None) -> BatchRecord | None:
+        active_state = run_state or self.load_run_state()
+        candidate_ids: list[str] = []
+        if active_state.manual_edit_batch_id:
+            candidate_ids.append(active_state.manual_edit_batch_id)
+        if active_state.last_generated_batch_id and active_state.last_generated_batch_id not in candidate_ids:
+            candidate_ids.append(active_state.last_generated_batch_id)
+
+        manual_statuses = {
+            BatchStatus.MANUAL_EDIT_REQUESTED,
+            BatchStatus.CANCELLED_FOR_MANUAL_EDIT,
+            BatchStatus.AWAITING_MANUAL_EDIT_RESUME,
+        }
+        for batch_id in candidate_ids:
+            record = self.load_batch_record(batch_id)
+            if record is not None and record.status in manual_statuses:
+                return record
+
+        for record in reversed(self.list_batch_records()):
+            if record.status in manual_statuses:
                 return record
         return None
 

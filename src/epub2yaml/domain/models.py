@@ -63,6 +63,25 @@ class FailureInfo(BaseModel):
     failed_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+class ManualEditSession(BaseModel):
+    book_id: str
+    batch_id: str
+    chapter_start: int
+    chapter_end: int
+    workspace_dir: str
+    editable_actors_path: str
+    editable_worldinfo_path: str
+    note_path: str | None = None
+    source_current_actors_hash: str
+    source_current_worldinfo_hash: str
+    status: str = "active"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    applied_at: datetime | None = None
+    editor_command: str | None = None
+    editor_exit_code: int | None = None
+    last_error: str | None = None
+
+
 class RunState(BaseModel):
     book_id: str
     source_file: str
@@ -81,6 +100,13 @@ class RunState(BaseModel):
     last_recovery_batch_id: str | None = None
     current_actors_version: int = 0
     current_worldinfo_version: int = 0
+    control_action: str | None = None
+    control_requested_at: datetime | None = None
+    awaiting_manual_edit: bool = False
+    manual_edit_batch_id: str | None = None
+    manual_edit_workspace: str | None = None
+    manual_edit_applied: bool = False
+    resume_from_manual_edit: bool = False
     status: str = "initialized"
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
@@ -101,6 +127,8 @@ class BatchRecord(BaseModel):
     review_decision: ReviewDecision | None = None
     retry_count: int = 0
     last_failure: FailureInfo | None = None
+    manual_edit_session: ManualEditSession | None = None
+    manual_edit_requested_at: datetime | None = None
 
 
 class RecoveryDecision(BaseModel):
@@ -113,6 +141,7 @@ class RecoveryDecision(BaseModel):
     next_chapter_index: int | None = None
     total_chapters: int | None = None
     batch_status: str | None = None
+    manual_edit_workspace: str | None = None
 
 
 class PipelineState(BaseModel):
