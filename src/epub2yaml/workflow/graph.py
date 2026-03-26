@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, TypedDict
 
@@ -8,12 +9,15 @@ from langgraph.graph import END, START, StateGraph
 
 from epub2yaml.domain.enums import BatchStatus, RunStatus
 from epub2yaml.domain.models import BatchRecord, ChapterBatch, DeltaPackage, FailureInfo, PipelineState
-from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml, parse_yaml_mapping_document
+from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package_with_warnings, parse_delta_yaml, parse_yaml_mapping_document
 from epub2yaml.infra.batch_store import BatchArtifactStore
 from epub2yaml.infra.review_store import ReviewQueueStore
 from epub2yaml.infra.state_store import StateStore
 from epub2yaml.infra.yaml_store import YamlDocumentStore
 from epub2yaml.llm.chains.document_update_chain import DocumentUpdateChain, DocumentUpdateRequest
+
+MAX_FILTERED_ACTORS = 12
+MAX_FILTERED_WORLDINFO = 20
 
 
 class GraphState(TypedDict, total=False):
@@ -23,6 +27,9 @@ class GraphState(TypedDict, total=False):
     batch: dict[str, Any] | None
     actors_current: str
     worldinfo_current: str
+    filtered_actors_yaml: str
+    filtered_worldinfo_yaml: str
+    filtered_context_summary: str | None
     prompt_text: str | None
     llm_raw_output: str | None
     delta_yaml: str | None
@@ -30,6 +37,7 @@ class GraphState(TypedDict, total=False):
     worldinfo_delta: dict[str, Any] | None
     actors_merged_preview: str | None
     worldinfo_merged_preview: str | None
+    merge_warnings: str | None
     validation_errors: list[str]
     review_decision: str | None
     edited_actors: str | None
@@ -59,6 +67,7 @@ def build_pipeline_graph(context: PipelineWorkflowContext):
     graph.add_node("handle_finish", _handle_finish(context))
     graph.add_node("prepare_batch", _prepare_batch(context))
     graph.add_node("load_current_documents", _load_current_documents(context))
+    graph.add_node("build_filtered_context", _build_filtered_context(context))
     graph.add_node("build_prompt", _build_prompt(context))
     graph.add_node("invoke_llm", _invoke_llm(context))
     graph.add_node("parse_delta_output", _parse_delta_output())
@@ -77,7 +86,15 @@ def build_pipeline_graph(context: PipelineWorkflowContext):
         },
     )
     graph.add_edge("prepare_batch", "load_current_documents")
-    graph.add_edge("load_current_documents", "build_prompt")
+    graph.add_edge("load_current_documents", "build_filtered_context")
+    graph.add_conditional_edges(
+        "build_filtered_context",
+        _route_after_step,
+        {
+            "ok": "build_prompt",
+            "failed": "handle_failure",
+        },
+    )
     graph.add_conditional_edges(
         "build_prompt",
         _route_after_step,
@@ -243,6 +260,57 @@ def _load_current_documents(context: PipelineWorkflowContext):
     return node
 
 
+def _build_filtered_context(context: PipelineWorkflowContext):
+    def node(state: GraphState) -> GraphState:
+        batch = _require_batch(state)
+        try:
+            actors_current = parse_yaml_mapping_document(state.get("actors_current", "actors: {}\n"), root_key="actors")
+            worldinfo_current = parse_yaml_mapping_document(state.get("worldinfo_current", "worldinfo: {}\n"), root_key="worldinfo")
+        except ValueError as exc:
+            message = f"构造 filtered context 失败: {exc}"
+            return {
+                "validation_errors": [message],
+                "error_message": message,
+                "failure_stage": "build_filtered_context",
+                "failure_retryable": False,
+                "suggested_action": "repair_current_documents",
+            }
+
+        filtered_actors, filtered_worldinfo, summary = _select_filtered_context(
+            batch.combined_text,
+            actors_current,
+            worldinfo_current,
+        )
+        filtered_actors_yaml = dump_yaml_document("actors", filtered_actors)
+        filtered_worldinfo_yaml = dump_yaml_document("worldinfo", filtered_worldinfo)
+        summary["size_stats"] = {
+            "actors_full_chars": len(state.get("actors_current", "actors: {}\n")),
+            "worldinfo_full_chars": len(state.get("worldinfo_current", "worldinfo: {}\n")),
+            "actors_filtered_chars": len(filtered_actors_yaml),
+            "worldinfo_filtered_chars": len(filtered_worldinfo_yaml),
+        }
+        summary_text = _dump_json(summary)
+
+        context.state_store.append_checkpoint(
+            "filtered_context_built",
+            {
+                "batch_id": batch.batch_id,
+                "actors_selected": len(filtered_actors),
+                "worldinfo_selected": len(filtered_worldinfo),
+                "warnings": len(summary.get("warnings", [])),
+            },
+        )
+        return {
+            "filtered_actors_yaml": filtered_actors_yaml,
+            "filtered_worldinfo_yaml": filtered_worldinfo_yaml,
+            "filtered_context_summary": summary_text,
+            "validation_errors": [],
+            "error_message": None,
+        }
+
+    return node
+
+
 def _build_prompt(context: PipelineWorkflowContext):
     def node(state: GraphState) -> GraphState:
         batch = _require_batch(state)
@@ -260,8 +328,8 @@ def _build_prompt(context: PipelineWorkflowContext):
         else:
             request = DocumentUpdateRequest(
                 batch=batch,
-                previous_actors_yaml=state.get("actors_current", "actors: {}\n"),
-                previous_worldinfo_yaml=state.get("worldinfo_current", "worldinfo: {}\n"),
+                filtered_actors_yaml=state.get("filtered_actors_yaml", "actors: {}\n"),
+                filtered_worldinfo_yaml=state.get("filtered_worldinfo_yaml", "worldinfo: {}\n"),
             )
             prompt_text = context.document_update_chain.render_prompt(request)
 
@@ -298,8 +366,8 @@ def _invoke_llm(context: PipelineWorkflowContext):
         else:
             request = DocumentUpdateRequest(
                 batch=batch,
-                previous_actors_yaml=state.get("actors_current", "actors: {}\n"),
-                previous_worldinfo_yaml=state.get("worldinfo_current", "worldinfo: {}\n"),
+                filtered_actors_yaml=state.get("filtered_actors_yaml", "actors: {}\n"),
+                filtered_worldinfo_yaml=state.get("filtered_worldinfo_yaml", "worldinfo: {}\n"),
             )
             try:
                 result = context.document_update_chain.invoke(request)
@@ -376,10 +444,24 @@ def _merge_delta_preview(context: PipelineWorkflowContext):
             actors=state.get("actors_delta"),
             worldinfo=state.get("worldinfo_delta"),
         )
-        merged_actors, merged_worldinfo = merge_delta_package(actors_current, worldinfo_current, delta_package)
+        try:
+            merge_result = merge_delta_package_with_warnings(actors_current, worldinfo_current, delta_package)
+        except ValueError as exc:
+            message = f"归并 merged preview 失败: {exc}"
+            return {
+                "validation_errors": [message],
+                "error_message": message,
+                "failure_stage": "merge_delta_preview",
+                "failure_retryable": False,
+                "suggested_action": "fix_delta_or_merge_rules",
+            }
+
         return {
-            "actors_merged_preview": dump_yaml_document("actors", merged_actors),
-            "worldinfo_merged_preview": dump_yaml_document("worldinfo", merged_worldinfo),
+            "actors_merged_preview": dump_yaml_document("actors", merge_result.actors),
+            "worldinfo_merged_preview": dump_yaml_document("worldinfo", merge_result.worldinfo),
+            "merge_warnings": _dump_json([asdict(warning) for warning in merge_result.warnings]),
+            "validation_errors": [],
+            "error_message": None,
         }
 
     return node
@@ -423,6 +505,8 @@ def _enqueue_review(context: PipelineWorkflowContext):
         context.batch_store.write_text_artifact(batch_id, "delta.yaml", state.get("delta_yaml") or "")
         context.batch_store.write_text_artifact(batch_id, "merged_actors.preview.yaml", state.get("actors_merged_preview") or "actors: {}\n")
         context.batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", state.get("worldinfo_merged_preview") or "worldinfo: {}\n")
+        context.batch_store.write_text_artifact(batch_id, "filtered_context_summary.json", state.get("filtered_context_summary") or "{}\n")
+        context.batch_store.write_text_artifact(batch_id, "merge_warnings.json", state.get("merge_warnings") or "[]\n")
 
         record = BatchRecord(
             batch=batch,
@@ -473,6 +557,10 @@ def _handle_failure(context: PipelineWorkflowContext):
                 context.batch_store.write_text_artifact(batch_id, "merged_actors.preview.yaml", state.get("actors_merged_preview") or "actors: {}\n")
             if state.get("worldinfo_merged_preview") is not None:
                 context.batch_store.write_text_artifact(batch_id, "merged_worldinfo.preview.yaml", state.get("worldinfo_merged_preview") or "worldinfo: {}\n")
+            if state.get("filtered_context_summary") is not None:
+                context.batch_store.write_text_artifact(batch_id, "filtered_context_summary.json", state.get("filtered_context_summary") or "{}\n")
+            if state.get("merge_warnings") is not None:
+                context.batch_store.write_text_artifact(batch_id, "merge_warnings.json", state.get("merge_warnings") or "[]\n")
 
             record = context.state_store.load_batch_record(batch_id) or BatchRecord(
                 batch=resolved_batch,
@@ -539,4 +627,145 @@ def _require_batch(state: GraphState) -> ChapterBatch:
     if isinstance(batch, ChapterBatch):
         return batch
     return ChapterBatch.model_validate(batch)
+
+
+def _select_filtered_context(chapter_text: str, actors_current: dict[str, Any], worldinfo_current: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ranked_actors = _rank_actors(actors_current, chapter_text)
+    ranked_worldinfo = _rank_worldinfo(worldinfo_current, chapter_text)
+
+    selected_actor_entries = ranked_actors[:MAX_FILTERED_ACTORS]
+    selected_worldinfo_entries = ranked_worldinfo[:MAX_FILTERED_WORLDINFO]
+
+    filtered_actors = {entry["name"]: actors_current[entry["name"]] for entry in selected_actor_entries}
+    filtered_worldinfo = {entry["name"]: worldinfo_current[entry["name"]] for entry in selected_worldinfo_entries}
+
+    warnings: list[str] = []
+    if not ranked_actors:
+        warnings.append("actors 未命中任何关键词，已使用空 actors 上下文。")
+    if not ranked_worldinfo:
+        warnings.append("worldinfo 未命中任何关键词，已使用空 worldinfo 上下文。")
+    if len(ranked_actors) > MAX_FILTERED_ACTORS:
+        warnings.append(f"actors 命中过多，已截断为 Top {MAX_FILTERED_ACTORS}。")
+    if len(ranked_worldinfo) > MAX_FILTERED_WORLDINFO:
+        warnings.append(f"worldinfo 命中过多，已截断为 Top {MAX_FILTERED_WORLDINFO}。")
+
+    summary = {
+        "actors": {
+            "matched": selected_actor_entries,
+            "truncated": [entry["name"] for entry in ranked_actors[MAX_FILTERED_ACTORS:]],
+            "candidate_count": len(ranked_actors),
+        },
+        "worldinfo": {
+            "matched": selected_worldinfo_entries,
+            "truncated": [entry["name"] for entry in ranked_worldinfo[MAX_FILTERED_WORLDINFO:]],
+            "candidate_count": len(ranked_worldinfo),
+        },
+        "warnings": warnings,
+    }
+    return filtered_actors, filtered_worldinfo, summary
+
+
+def _rank_actors(actors_current: dict[str, Any], chapter_text: str) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for actor_name, actor_payload in actors_current.items():
+        if not isinstance(actor_payload, dict):
+            continue
+        trigger_hits = _collect_hits(chapter_text, _coerce_keyword_list(actor_payload.get("trigger_keywords")))
+        alias_hits = _collect_hits(chapter_text, _collect_actor_aliases(actor_name, actor_payload))
+        score = trigger_hits["total_hits"] * 10 + alias_hits["total_hits"] * 3 + len(trigger_hits["matched_keywords"]) * 2 + len(alias_hits["matched_keywords"])
+        if score <= 0:
+            continue
+        ranked.append(
+            {
+                "name": actor_name,
+                "score": score,
+                "trigger_hit_count": trigger_hits["total_hits"],
+                "alias_hit_count": alias_hits["total_hits"],
+                "matched_keywords": _dedupe_preserve_order([*trigger_hits["matched_keywords"], *alias_hits["matched_keywords"]]),
+            }
+        )
+    ranked.sort(key=lambda item: (-item["score"], -item["trigger_hit_count"], -item["alias_hit_count"], item["name"]))
+    return ranked
+
+
+def _rank_worldinfo(worldinfo_current: dict[str, Any], chapter_text: str) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for entry_name, entry_payload in worldinfo_current.items():
+        if not isinstance(entry_payload, dict):
+            continue
+        key_hits = _collect_hits(chapter_text, _coerce_keyword_list(entry_payload.get("keys")))
+        if key_hits["total_hits"] <= 0:
+            continue
+        ranked.append(
+            {
+                "name": entry_name,
+                "score": key_hits["total_hits"] * 10 + len(key_hits["matched_keywords"]),
+                "key_hit_count": key_hits["total_hits"],
+                "matched_keywords": key_hits["matched_keywords"],
+            }
+        )
+    ranked.sort(key=lambda item: (-item["score"], -item["key_hit_count"], item["name"]))
+    return ranked
+
+
+def _collect_actor_aliases(actor_name: str, actor_payload: dict[str, Any]) -> list[str]:
+    aliases = [actor_name]
+    name_payload = actor_payload.get("name")
+    if isinstance(name_payload, dict):
+        for value in name_payload.values():
+            aliases.extend(_coerce_keyword_list(value))
+    return _dedupe_preserve_order(aliases)
+
+
+def _collect_hits(chapter_text: str, keywords: list[str]) -> dict[str, Any]:
+    normalized_text = chapter_text.casefold()
+    matched_keywords: list[str] = []
+    total_hits = 0
+    for keyword in _dedupe_preserve_order(keywords):
+        normalized_keyword = keyword.casefold().strip()
+        if len(normalized_keyword) < 2:
+            continue
+        hit_count = normalized_text.count(normalized_keyword)
+        if hit_count <= 0:
+            continue
+        matched_keywords.append(keyword)
+        total_hits += hit_count
+    return {
+        "matched_keywords": matched_keywords,
+        "total_hits": total_hits,
+    }
+
+
+def _coerce_keyword_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    if isinstance(value, list):
+        keywords: list[str] = []
+        for item in value:
+            if item is None:
+                continue
+            text = str(item).strip()
+            if text:
+                keywords.append(text)
+        return keywords
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = value.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(value)
+    return deduped
+
+
+def _dump_json(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 

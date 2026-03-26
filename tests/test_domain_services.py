@@ -7,7 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from epub2yaml.domain.models import Chapter
-from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, parse_delta_yaml
+from epub2yaml.domain.services import build_batches, dump_yaml_document, merge_delta_package, merge_delta_package_with_warnings, parse_delta_yaml
 
 
 class DomainServicesTests(unittest.TestCase):
@@ -76,7 +76,7 @@ class DomainServicesTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "根节点必须是映射"):
             parse_delta_yaml("- invalid")
 
-    def test_merge_delta_package_merges_nested_dict_and_replaces_list(self) -> None:
+    def test_merge_delta_package_merges_nested_dict_and_replaces_scalar_list(self) -> None:
         actors_current = {
             "Alice": {
                 "profile": {
@@ -112,6 +112,153 @@ class DomainServicesTests(unittest.TestCase):
         self.assertEqual(["coffee"], merged_actors["Alice"]["profile"]["likes"])
         self.assertEqual("new", merged_worldinfo["Academy"]["content"])
         self.assertEqual(["school"], merged_worldinfo["Academy"]["tags"])
+
+    def test_merge_delta_package_normalizes_actor_character_brief_description_into_basic_settings(self) -> None:
+        actors_current = {
+            "Anju": {
+                "basic_settings": {
+                    "identity": ["女仆长"],
+                    "character_brief_description": ["旧描述"],
+                },
+                "trivia_facts": ["旧事实"],
+            }
+        }
+        package = parse_delta_yaml(
+            """
+            delta:
+              actors:
+                Anju:
+                  character_brief_description:
+                    - 新描述
+                    - 新补充
+            """
+        )
+
+        result = merge_delta_package_with_warnings(actors_current, {}, package)
+
+        self.assertEqual(
+            ["新描述", "新补充"],
+            result.actors["Anju"]["basic_settings"]["character_brief_description"],
+        )
+        self.assertNotIn("character_brief_description", result.actors["Anju"])
+
+    def test_merge_delta_package_with_warnings_merges_registered_object_array_by_identifier(self) -> None:
+        actors_current = {
+            "Alice": {
+                "personality_core": {
+                    "personal_traits": [
+                        {
+                            "trait_name": "Brave",
+                            "scope": "battle",
+                            "manifestations": ["protects allies"],
+                            "notes": "existing",
+                        }
+                    ]
+                }
+            }
+        }
+        package = parse_delta_yaml(
+            """
+            delta:
+              actors:
+                Alice:
+                  personality_core:
+                    personal_traits:
+                      - trait_name: Brave
+                        scope: battle
+                        manifestations:
+                          - never retreats
+                      - trait_name: Kind
+                        scope: daily
+                        manifestations:
+                          - helps strangers
+            """
+        )
+
+        result = merge_delta_package_with_warnings(actors_current, {}, package)
+        traits = result.actors["Alice"]["personality_core"]["personal_traits"]
+
+        self.assertEqual(2, len(traits))
+        self.assertEqual("existing", traits[0]["notes"])
+        self.assertEqual(["never retreats"], traits[0]["manifestations"])
+        self.assertEqual("Kind", traits[1]["trait_name"])
+        self.assertEqual([], result.warnings)
+
+    def test_merge_delta_package_with_warnings_replaces_unknown_object_array_and_records_warning(self) -> None:
+        worldinfo_current = {
+            "Academy": {
+                "content": {
+                    "entries": [
+                        {"name": "gate", "detail": "old"},
+                    ]
+                }
+            }
+        }
+        package = parse_delta_yaml(
+            """
+            delta:
+              worldinfo:
+                Academy:
+                  content:
+                    entries:
+                      - name: gate
+                        detail: new
+            """
+        )
+
+        result = merge_delta_package_with_warnings({}, worldinfo_current, package)
+
+        self.assertEqual("new", result.worldinfo["Academy"]["content"]["entries"][0]["detail"])
+        self.assertEqual("object_array_replace_fallback", result.warnings[0].code)
+
+    def test_merge_delta_package_with_warnings_falls_back_when_identifier_field_missing(self) -> None:
+        actors_current = {
+            "Alice": {
+                "canon_timeline": [
+                    {
+                        "event": "Admission",
+                        "timeframe": "Day1",
+                        "description": "old",
+                    }
+                ]
+            }
+        }
+        package = parse_delta_yaml(
+            """
+            delta:
+              actors:
+                Alice:
+                  canon_timeline:
+                    - event: Admission
+                      description: new
+            """
+        )
+
+        result = merge_delta_package_with_warnings(actors_current, {}, package)
+
+        timeline = result.actors["Alice"]["canon_timeline"]
+        self.assertEqual("new", timeline[0]["description"])
+        self.assertNotIn("timeframe", timeline[0])
+        self.assertEqual("missing_identifier_fields", result.warnings[0].code)
+
+    def test_merge_delta_package_with_warnings_rejects_incompatible_types(self) -> None:
+        worldinfo_current = {
+            "Academy": {
+                "content": {"location": "old"},
+            }
+        }
+        package = parse_delta_yaml(
+            """
+            delta:
+              worldinfo:
+                Academy:
+                  content:
+                    - invalid
+            """
+        )
+
+        with self.assertRaisesRegex(ValueError, "类型不兼容"):
+            merge_delta_package_with_warnings({}, worldinfo_current, package)
 
     def test_dump_yaml_document_contains_root_key(self) -> None:
         document = dump_yaml_document("actors", {"Alice": {"role": "hero"}})

@@ -122,6 +122,9 @@ class PipelineState(BaseModel):
     batch: ChapterBatch | None = None
     actors_current: str = "actors: {}\n"
     worldinfo_current: str = "worldinfo: {}\n"
+    filtered_actors_yaml: str = "actors: {}\n"
+    filtered_worldinfo_yaml: str = "worldinfo: {}\n"
+    filtered_context_summary: str | None = None
     prompt_text: str | None = None
     llm_raw_output: str | None = None
     delta_yaml: str | None = None
@@ -129,6 +132,7 @@ class PipelineState(BaseModel):
     worldinfo_delta: dict[str, Any] | None = None
     actors_merged_preview: str | None = None
     worldinfo_merged_preview: str | None = None
+    merge_warnings: str | None = None
     validation_errors: list[str] = Field(default_factory=list)
     review_decision: str | None = None
     edited_actors: str | None = None

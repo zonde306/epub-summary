@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -154,6 +155,118 @@ class MVPPipelineTests(unittest.TestCase):
                 mock_extract_epub.return_value = []
                 with self.assertRaisesRegex(ValueError, "未从 EPUB 中提取到可处理章节"):
                     service.generate_yaml(epub_path, book_id="empty-book")
+
+    def test_run_to_completion_builds_filtered_context_and_preserves_full_merge_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "context.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "爱丽丝在学院学习，学院位于山谷中", 8),
+                ]
+                service.init_run(epub_path, book_id="context-book")
+
+            run_dir = workspace_dir / "runs" / "context-book"
+            (run_dir / "current" / "actors.yaml").write_text(
+                """
+                actors:
+                  Alice:
+                    trigger_keywords:
+                      - 爱丽丝
+                    profile:
+                      role: student
+                  Bob:
+                    trigger_keywords:
+                      - 鲍勃
+                    profile:
+                      role: teacher
+                """,
+                encoding="utf-8",
+            )
+            (run_dir / "current" / "worldinfo.yaml").write_text(
+                """
+                worldinfo:
+                  Academy:
+                    keys: 学院,山谷
+                    content: old academy
+                  Castle:
+                    keys: 城堡
+                    content: old castle
+                """,
+                encoding="utf-8",
+            )
+
+            result = service.run_to_completion(
+                "context-book",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      actors:
+                        Alice:
+                          profile:
+                            role: hero
+                    """,
+                },
+            )
+
+            self.assertEqual("completed", result["status"])
+            batch_dir = run_dir / "batches" / "0001"
+            summary = json.loads((batch_dir / "filtered_context_summary.json").read_text(encoding="utf-8"))
+            merged_preview = (batch_dir / "merged_actors.preview.yaml").read_text(encoding="utf-8")
+
+            self.assertEqual(["Alice"], [item["name"] for item in summary["actors"]["matched"]])
+            self.assertEqual(["Academy"], [item["name"] for item in summary["worldinfo"]["matched"]])
+            self.assertIn("Bob", merged_preview)
+            self.assertIn("role: teacher", merged_preview)
+
+    def test_run_to_completion_persists_merge_warning_when_unknown_object_array_replaced(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            workspace_dir = Path(temp_dir)
+            service = PipelineService(workspace_dir)
+            epub_path = workspace_dir / "warnings.epub"
+            epub_path.write_bytes(b"fake-epub")
+
+            with patch("epub2yaml.app.services.extract_epub") as mock_extract_epub:
+                mock_extract_epub.return_value = [
+                    self._chapter(0, "第一章", "chapter1.xhtml", "学院入口发生变化", 8),
+                ]
+                service.init_run(epub_path, book_id="warning-book")
+
+            run_dir = workspace_dir / "runs" / "warning-book"
+            (run_dir / "current" / "worldinfo.yaml").write_text(
+                """
+                worldinfo:
+                  Academy:
+                    keys: 学院,入口
+                    content:
+                      entries:
+                        - name: gate
+                          detail: old
+                """,
+                encoding="utf-8",
+            )
+
+            result = service.run_to_completion(
+                "warning-book",
+                delta_yaml_by_batch={
+                    "0001": """
+                    delta:
+                      worldinfo:
+                        Academy:
+                          content:
+                            entries:
+                              - name: gate
+                                detail: new
+                    """,
+                },
+            )
+
+            self.assertEqual("completed", result["status"])
+            warnings = json.loads((run_dir / "batches" / "0001" / "merge_warnings.json").read_text(encoding="utf-8"))
+            self.assertEqual("object_array_replace_fallback", warnings[0]["code"])
 
     @staticmethod
     def _chapter(index: int, title: str, source_href: str, content_text: str, estimated_tokens: int) -> Chapter:
